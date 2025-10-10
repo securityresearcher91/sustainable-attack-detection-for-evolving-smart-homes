@@ -1,0 +1,8 @@
+joblib==1.2.0
+numpy==1.23.3
+pandas==1.5.0
+pyod==2.0.5
+river==0.22.0
+scapy==2.5.0
+scikit_learn==1.2.2
+tensorflow==2.20.0

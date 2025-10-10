@@ -1,0 +1,7 @@
+Flask==2.3.2
+opencv-python==4.9.0.80
+pyngrok==7.2.3
+numpy<2
+requests
+dnspython
+httpx
