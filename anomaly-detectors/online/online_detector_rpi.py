@@ -43,34 +43,212 @@ BATCH_INTERVAL = 30
 MIN_FLOW_DURATION = 0.1
 LEARNING_WINDOW_DEFAULT = 300  # 5 minutes learning phase
 
-# Initial detection thresholds (will be adapted during runtime)
-INIT_HST_THRESHOLD = 0.48 
-INIT_OCSVM_THRESHOLD = -1.034788
-INIT_LOF_THRESHOLD = -16.121545
-INIT_COPOD_THRESHOLD = 18.400942
+# Detection thresholds (updated from supervised thresholds 2025-09-21T09:37:57.044751)
+HST_THRESHOLD = 0
+OCSVM_THRESHOLD = -0.90
+LOF_THRESHOLD = -16.121545
+COPOD_THRESHOLD = 18.400942
 
-# Adaptive threshold settings
-ADAPTIVE_THRESHOLD_ENABLED = True
-ADAPTIVE_WINDOW_SIZE = 500  # Number of scores to keep for percentile calculation
-ADAPTIVE_PERCENTILE = 99    # Percentile to use for threshold calculation (higher = fewer alerts)
-ADAPTIVE_UPDATE_FREQ = 50   # Update threshold every N samples
-ADAPTIVE_SMOOTHING = 0.9    # Smoothing factor (higher = slower adaptation)
+# Network functionality protocols that should always be allowed
+# DHCP (UDP 67/68), DNS (UDP 53), ARP is handled separately
+ALLOWED_NETWORK_PROTOCOLS = {
+    67,   # DHCP server
+    68,   # DHCP client
+    53,   # DNS
+}
 
-# Global variables for tracking thresholds - don't access directly, use OnlineDetectorRPi.adaptive_thresholds
-HST_THRESHOLD = INIT_HST_THRESHOLD
-OCSVM_THRESHOLD = INIT_OCSVM_THRESHOLD
-LOF_THRESHOLD = INIT_LOF_THRESHOLD
-COPOD_THRESHOLD = INIT_COPOD_THRESHOLD
-
-# Debug log helper functions
-def debug_log(message):
-    """Print debug messages only when DEBUG flag is enabled"""
-    if DEBUG:
-        print(f"[DEBUG] {message}")
+class AbuseIPDBDenyList:
+    """
+    Handles IP reputation checking using a local AbuseIPDB deny list CSV file.
+    CSV format: ip,country_code,abuse_confidence_score,last_reported_at
+    
+    Logic:
+    - If IP is in deny list: Flag as malicious (confirmed anomaly)
+    - If IP is private/local: Flag as suspicious (confirmed anomaly)
+    - If IP is public but not in deny list: Don't flag (likely false positive)
+    - Network functionality traffic (DHCP, DNS to router): Always whitelist
+    """
+    
+    def __init__(self, denylist_file=None, router_ip=None):
+        self.denylist_file = denylist_file
+        self.router_ip = router_ip
+        self.enabled = bool(denylist_file)
+        self.deny_list = {}  # {ip: {'country_code': str, 'score': int, 'last_reported': str}}
         
-def info_log(message):
-    """Print important info messages regardless of debug setting"""
-    print(message)
+        if self.enabled:
+            self.load_denylist()
+        else:
+            print("AbuseIPDB Deny List: DISABLED (no file specified)")
+    
+    def load_denylist(self):
+        """Load AbuseIPDB deny list from CSV file"""
+        try:
+            if not os.path.exists(self.denylist_file):
+                print(f"⚠️  Deny list file not found: {self.denylist_file}")
+                self.enabled = False
+                return
+            
+            import csv
+            with open(self.denylist_file, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    ip = row['ip'].strip()
+                    self.deny_list[ip] = {
+                        'country_code': row.get('country_code', '').strip(),
+                        'score': int(row.get('abuse_confidence_score', 0)),
+                        'last_reported': row.get('last_reported_at', '').strip()
+                    }
+            
+            print(f"AbuseIPDB Deny List: ENABLED")
+            print(f"  File: {self.denylist_file}")
+            print(f"  Loaded {len(self.deny_list)} malicious IPs")
+            if self.router_ip:
+                print(f"  Router IP: {self.router_ip} (whitelisted for network functionality)")
+        
+        except Exception as e:
+            print(f"⚠️  Error loading deny list: {e}")
+            self.enabled = False
+            self.deny_list = {}
+    
+    def is_network_functionality(self, src_ip, dst_ip, src_port, dst_port):
+        """
+        Check if traffic is network functionality (DHCP, DNS to router).
+        These should always be allowed regardless of anomaly detection.
+        
+        IMPORTANT: Be very specific to avoid whitelisting attack traffic!
+        - DHCP: Only whitelist if BOTH IPs are in expected ranges
+        - DNS: Only whitelist if destination is the router
+        """
+        # DHCP traffic (ports 67/68)
+        # Only whitelist if it's actual DHCP communication (server:67, client:68)
+        if (src_port == 67 and dst_port == 68) or (src_port == 68 and dst_port == 67):
+            return True, "DHCP"
+        
+        # DNS to router (port 53)
+        # Only whitelist if destination is router and port is 53
+        # Do NOT whitelist if source port is 53 (that could be spoofed)
+        if self.router_ip and dst_ip == self.router_ip and dst_port == 53:
+            return True, "DNS_to_router"
+        
+        return False, None
+    
+    def check_ip(self, src_ip, dst_ip, src_port, dst_port):
+        """
+        Check IP against deny list and private IP ranges.
+        
+        IMPORTANT: We need to identify the REMOTE IP (non-camera IP) and check that.
+        - If camera is source: check destination IP (remote endpoint)
+        - If camera is destination: check source IP (remote endpoint)
+        
+        Returns dict with:
+        - in_denylist: bool (IP is in AbuseIPDB deny list)
+        - is_private: bool (Remote IP is in private/local range)
+        - is_network_function: bool (DHCP, DNS to router)
+        - should_flag: bool (True if anomaly should be confirmed)
+        - reason: str (explanation)
+        - score: int (abuse confidence score if in deny list)
+        """
+        result = {
+            'in_denylist': False,
+            'is_private': False,
+            'is_network_function': False,
+            'should_flag': False,
+            'reason': 'unknown',
+            'score': 0,
+            'country_code': '',
+            'remote_ip': None
+        }
+        
+        # Check if this is network functionality traffic (always whitelist)
+        is_net_func, func_type = self.is_network_functionality(src_ip, dst_ip, src_port, dst_port)
+        if is_net_func:
+            result['is_network_function'] = True
+            result['should_flag'] = False
+            result['reason'] = f'network_functionality_{func_type}'
+            return result
+        
+        # Determine remote IP (the endpoint the camera is communicating with)
+        # The camera is typically on a private IP (10.x, 192.168.x, etc.)
+        # We want to check the reputation of the OTHER endpoint (public internet IP)
+        
+        src_is_private = self.is_private_ip(src_ip)
+        dst_is_private = self.is_private_ip(dst_ip)
+        
+        # Determine which IP is the "remote endpoint" to check
+        if src_is_private and not dst_is_private:
+            # Traffic from camera (private) to internet (public)
+            # Check the destination (remote server)
+            remote_ip = dst_ip
+            result['remote_ip'] = remote_ip
+        elif not src_is_private and dst_is_private:
+            # Traffic from internet (public) to camera (private)
+            # Check the source (remote server)
+            remote_ip = src_ip
+            result['remote_ip'] = remote_ip
+        elif src_is_private and dst_is_private:
+            # Both private - suspicious local network communication
+            # This could be lateral movement or local attacks
+            result['is_private'] = True
+            result['should_flag'] = True
+            result['reason'] = 'private_to_private'
+            result['remote_ip'] = f"both_private_{src_ip}_to_{dst_ip}"
+            return result
+        else:
+            # Both public - unusual for IoT camera, but check destination
+            remote_ip = dst_ip
+            result['remote_ip'] = remote_ip
+        
+        # At this point, remote_ip is the public endpoint to validate
+        # If deny list is disabled, don't flag legitimate public IPs
+        if not self.enabled:
+            result['reason'] = 'public_ip_no_denylist_check'
+            result['should_flag'] = False
+            return result
+        
+        # Check if remote IP is in the deny list
+        if remote_ip in self.deny_list:
+            entry = self.deny_list[remote_ip]
+            result['in_denylist'] = True
+            result['should_flag'] = True
+            result['reason'] = 'in_denylist'
+            result['score'] = entry['score']
+            result['country_code'] = entry['country_code']
+            print(f"🚨 Remote IP {remote_ip} found in deny list (score: {entry['score']}, country: {entry['country_code']})")
+            return result
+        
+        # Remote IP is public but NOT in deny list
+        # This is likely a legitimate cloud service (DNS, API, streaming, etc.)
+        # Suppress the anomaly
+        result['reason'] = 'public_ip_not_in_denylist'
+        result['should_flag'] = False
+        print(f"✓ Remote IP {remote_ip} not in deny list - likely legitimate (suppressing anomaly)")
+        return result
+    
+    def is_private_ip(self, ip):
+        """Check if IP is in private/local range"""
+        try:
+            parts = list(map(int, ip.split('.')))
+            
+            # Private IP ranges:
+            # 10.0.0.0/8
+            if parts[0] == 10:
+                return True
+            # 172.16.0.0/12
+            if parts[0] == 172 and 16 <= parts[1] <= 31:
+                return True
+            # 192.168.0.0/16
+            if parts[0] == 192 and parts[1] == 168:
+                return True
+            # 127.0.0.0/8 (loopback)
+            if parts[0] == 127:
+                return True
+            # Link-local 169.254.0.0/16
+            if parts[0] == 169 and parts[1] == 254:
+                return True
+            
+            return False
+        except:
+            return False
 
 class OnlineDetectorRPi:
     def __init__(self, args):
@@ -80,24 +258,11 @@ class OnlineDetectorRPi:
         self.learning_start = None
         self.learning_window = args.learning_window  # Store learning window from args
         
-        # Set global debug flag
-        global DEBUG
-        DEBUG = args.debug
-        
         # Initialize flow tracking
         self.flow_stats = {}
         self.packet_times = defaultdict(lambda: deque(maxlen=2))
         self.last_batch_time = time.time()
         self.learning_data = []
-        
-        # Initialize adaptive thresholds
-        self.adaptive_thresholds = {
-            'hst': INIT_HST_THRESHOLD,
-            'ocsvm': INIT_OCSVM_THRESHOLD,
-            'lof': INIT_LOF_THRESHOLD,
-            'copod': INIT_COPOD_THRESHOLD
-        }
-        self.sample_count_since_update = 0
         
         # Initialize models
         self.hst = HalfSpaceTrees(
@@ -123,6 +288,12 @@ class OnlineDetectorRPi:
         self.attacker_mac = args.attacker_mac.lower()
         self.camera_mac = args.camera_mac.lower()
         
+        # Initialize AbuseIPDB deny list checker
+        denylist_file = getattr(args, 'denylist_file', None)
+        router_ip = getattr(args, 'router_ip', None)
+        self.denylist = AbuseIPDBDenyList(denylist_file=denylist_file, router_ip=router_ip)
+        self.enable_denylist = bool(denylist_file)
+        
         # Setup MacBook connection
         self.macbook_sock = None
         if args.macbook_ip:
@@ -147,20 +318,14 @@ class OnlineDetectorRPi:
         self.threshold_update_interval = 300  # 5 minutes
         
         # Initialize threshold log files
-        self.unsupervised_threshold_log = "thresholds_unsupervised_rpi.log"
-        self.supervised_threshold_log = "thresholds_supervised_rpi.log"
-        self.adaptive_threshold_log = "thresholds_adaptive_rpi.log"
+        self.unsupervised_threshold_log = "thresholds_unsupervised.log"
+        self.supervised_threshold_log = "thresholds_supervised.log"
         
         # Create log files with headers (always rewrite)
         with open(self.unsupervised_threshold_log, 'w') as f:
             f.write("timestamp,hst_threshold,ocsvm_threshold,lof_threshold,copod_threshold\n")
         with open(self.supervised_threshold_log, 'w') as f:
             f.write("timestamp,hst_threshold,ocsvm_threshold,lof_threshold,copod_threshold\n")
-        with open(self.adaptive_threshold_log, 'w') as f:
-            f.write("timestamp,hst_threshold,ocsvm_threshold,lof_threshold,copod_threshold\n")
-            # Write initial values
-            timestamp = datetime.now().isoformat()
-            f.write(f"{timestamp},{self.adaptive_thresholds['hst']:.6f},{self.adaptive_thresholds['ocsvm']:.6f},{self.adaptive_thresholds['lof']:.6f},{self.adaptive_thresholds['copod']:.6f}\n")
 
     def _signal_handler(self, signum, frame):
         print(f"\nReceived signal {signum}, stopping gracefully...")
@@ -193,97 +358,16 @@ class OnlineDetectorRPi:
 
     def connect_to_macbook(self, ip, port):
         try:
-            print(f"Attempting to connect to DL server at {ip}:{port}...")
-            
-            # Close existing connection if any
-            if self.macbook_sock:
-                try:
-                    self.macbook_sock.close()
-                except:
-                    pass
-                self.macbook_sock = None
-                
-            # Create new socket
             self.macbook_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            
-            # Set a timeout so we don't hang forever
-            self.macbook_sock.settimeout(10)  # Increased timeout for networks with higher latency
-            
-            # Print address info for debugging
-            try:
-                print(f"Local address: {socket.gethostbyname(socket.gethostname())}")
-                print(f"Connecting to remote address: {ip}:{port}")
-            except:
-                pass
-                
-            # Try to connect
             self.macbook_sock.connect((ip, port))
-            
-            # Set back to blocking mode for normal operation
-            self.macbook_sock.settimeout(None)
             print(f"✅ Connected to DL server at {ip}:{port}")
-            
-            # Send a ping message to test the connection
-            try:
-                ping_msg = json.dumps({
-                    'type': 'ping',
-                    'timestamp': datetime.now().isoformat(),
-                    'client_ip': socket.gethostbyname(socket.gethostname())
-                }) + '\n'
-                self.macbook_sock.send(ping_msg.encode())
-                print("✅ Successfully sent test message to DL server")
-                
-                # Try to receive a ping response
-                self.macbook_sock.settimeout(5)
-                try:
-                    response = self.macbook_sock.recv(1024)
-                    print(f"Received response from server: {response.decode('utf-8', errors='replace')}")
-                except socket.timeout:
-                    print("No ping response received (timeout), but connection established")
-                except Exception as e:
-                    print(f"Error receiving ping response: {e}")
-                finally:
-                    # Reset to blocking mode
-                    self.macbook_sock.settimeout(None)
-                
-            except Exception as e:
-                print(f"⚠️ Failed to send test message: {e}")
-                self.macbook_sock = None
-                
-        except ConnectionRefusedError:
-            print(f"⚠️ Connection refused - DL server at {ip}:{port} is not accepting connections")
-            print("Please ensure the DL server is running and the port is correct")
-            self.macbook_sock = None
-        except socket.gaierror:
-            print(f"⚠️ Address error - Could not resolve {ip}")
-            print("Please check the IP address of the DL server")
-            self.macbook_sock = None
         except Exception as e:
             print(f"⚠️ DL server connection failed: {e}")
             self.macbook_sock = None
-            
-        # Schedule a reconnection attempt if we failed
-        if not self.macbook_sock and not self.stopped:
-            def reconnect_attempt():
-                if not self.macbook_sock and not self.stopped:
-                    print(f"Attempting to reconnect to DL server...")
-                    self.connect_to_macbook(ip, port)
-            
-            # Try to reconnect in the background after a delay (increased to 60s)
-            print(f"Will attempt to reconnect in 60 seconds")
-            threading.Timer(60, reconnect_attempt).start()
 
     def send_to_macbook(self, flow_key_5t, src_mac, dst_mac, features):
         if not self.macbook_sock:
-            # Try to reconnect if we have connection info
-            if hasattr(self.args, 'macbook_ip') and self.args.macbook_ip:
-                # Don't reconnect on every message, use a timer
-                if not hasattr(self, '_last_reconnect_attempt') or time.time() - self._last_reconnect_attempt > 60:
-                    self._last_reconnect_attempt = time.time()
-                    print(f"No active connection. Attempting to reconnect to DL server...")
-                    self.connect_to_macbook(self.args.macbook_ip, self.args.macbook_port)
             return
-            
         try:
             # Use the same field names that learning_rpi.py used to use
             msg = json.dumps({
@@ -295,65 +379,26 @@ class OnlineDetectorRPi:
             }) + '\n'
             
             # Debug output
-            if not hasattr(self, '_send_count'):
-                self._send_count = 0
-                self._last_status_time = 0
+            if hasattr(self, '_send_count'):
+                self._send_count += 1
+            else:
+                self._send_count = 1
                 
-            self._send_count += 1
-            
-            # Print status periodically
-            current_time = time.time()
-            if self._send_count <= 5 or current_time - self._last_status_time > 30:
+            if self._send_count <= 5 or self._send_count % 50 == 0:
                 print(f"📤 Sending sample #{self._send_count} to DL server")
-                self._last_status_time = current_time
                 
-            # Send heartbeat/ping every 100 messages
-            if self._send_count % 100 == 0:
-                try:
-                    ping_msg = json.dumps({
-                        'type': 'ping',
-                        'timestamp': datetime.now().isoformat()
-                    }) + '\n'
-                    self.macbook_sock.send(ping_msg.encode())
-                    print("✅ Sent heartbeat ping to DL server")
-                except Exception as ping_error:
-                    print(f"⚠️ Error sending ping: {ping_error}")
-                
-            # Send the actual data
             self.macbook_sock.send(msg.encode())
-            
-        except ConnectionResetError:
-            print(f"⚠️ Connection reset by DL server")
-            self.macbook_sock = None
-            # Schedule a reconnection
-            if hasattr(self.args, 'macbook_ip') and self.args.macbook_ip:
-                threading.Timer(10, lambda: self.connect_to_macbook(
-                    self.args.macbook_ip, self.args.macbook_port)).start()
-                
-        except BrokenPipeError:
-            print(f"⚠️ Broken pipe - DL server has closed the connection")
-            self.macbook_sock = None
-            # Schedule a reconnection
-            if hasattr(self.args, 'macbook_ip') and self.args.macbook_ip:
-                threading.Timer(10, lambda: self.connect_to_macbook(
-                    self.args.macbook_ip, self.args.macbook_port)).start()
-                
         except Exception as e:
             print(f"⚠️ Error sending to DL server: {e}")
-            
-            # Check if socket is still connected
-            try:
-                # Try sending a small ping to check connection
-                self.macbook_sock.settimeout(1)
-                self.macbook_sock.send(b'{"type":"ping"}\n')
-                self.macbook_sock.settimeout(None)
-            except:
-                print("Socket appears to be disconnected. Attempting to reconnect...")
-                self.macbook_sock = None
-                # Try to reconnect
-                if hasattr(self.args, 'macbook_ip') and self.args.macbook_ip:
-                    threading.Timer(5, lambda: self.connect_to_macbook(
-                        self.args.macbook_ip, self.args.macbook_port)).start()
+            # Try to reconnect
+            if self.args.macbook_ip:
+                try:
+                    self.macbook_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    self.macbook_sock.connect((self.args.macbook_ip, self.args.macbook_port))
+                    print("✅ Reconnected to DL server")
+                except Exception as reconnect_error:
+                    print(f"❌ Reconnection failed: {reconnect_error}")
+                    self.macbook_sock = None
 
     def save_models(self):
         print("Saving models...")
@@ -362,18 +407,7 @@ class OnlineDetectorRPi:
             pickle.dump(self.hst, f)
         for name, model in self.models.items():
             joblib.dump(model, os.path.join(MODEL_DIR, f"{name}.joblib"))
-            
-        # Save current adaptive thresholds
-        with open(os.path.join(MODEL_DIR, "adaptive_thresholds.json"), 'w') as f:
-            json.dump({
-                "hst": self.adaptive_thresholds['hst'],
-                "ocsvm": self.adaptive_thresholds['ocsvm'],
-                "lof": self.adaptive_thresholds['lof'],
-                "copod": self.adaptive_thresholds['copod'],
-                "timestamp": datetime.now().isoformat()
-            }, f, indent=4)
-            
-        print("Models and thresholds saved")
+        print("Models saved")
 
     def stop(self):
         self.stopped = True
@@ -454,25 +488,14 @@ class OnlineDetectorRPi:
         
         if hst_scores:
             calculated_hst = np.percentile(hst_scores, contamination_rate * 100)
-            print(f"HST - Current: {self.adaptive_thresholds['hst']:.4f}, Calculated: {calculated_hst:.4f}")
-            # Update adaptive threshold if calculated value is better
-            if calculated_hst > 0:
-                self.adaptive_thresholds['hst'] = calculated_hst
-                global HST_THRESHOLD
-                HST_THRESHOLD = calculated_hst
-                print(f"HST threshold updated to {calculated_hst:.4f}")
+            print(f"HST - Current: {HST_THRESHOLD:.4f}, Calculated: {calculated_hst:.4f}")
         
         # OC-SVM threshold
         if 'ocsvm' in self.models:
             try:
                 ocsvm_scores = self.models['ocsvm'].decision_function(X_train)
                 calculated_ocsvm = np.percentile(ocsvm_scores, contamination_rate * 100)
-                print(f"OC-SVM - Current: {self.adaptive_thresholds['ocsvm']:.4f}, Calculated: {calculated_ocsvm:.4f}")
-                # Update threshold
-                self.adaptive_thresholds['ocsvm'] = calculated_ocsvm
-                global OCSVM_THRESHOLD
-                OCSVM_THRESHOLD = calculated_ocsvm
-                print(f"OC-SVM threshold updated to {calculated_ocsvm:.4f}")
+                print(f"OC-SVM - Current: {OCSVM_THRESHOLD:.4f}, Calculated: {calculated_ocsvm:.4f}")
             except Exception as e:
                 print(f"⚠️ Error calculating OC-SVM threshold: {e}")
         
@@ -481,12 +504,7 @@ class OnlineDetectorRPi:
             try:
                 lof_scores = self.models['lof'].decision_function(X_train)
                 calculated_lof = np.percentile(lof_scores, contamination_rate * 100)
-                print(f"LOF - Current: {self.adaptive_thresholds['lof']:.4f}, Calculated: {calculated_lof:.4f}")
-                # Update threshold
-                self.adaptive_thresholds['lof'] = calculated_lof
-                global LOF_THRESHOLD
-                LOF_THRESHOLD = calculated_lof
-                print(f"LOF threshold updated to {calculated_lof:.4f}")
+                print(f"LOF - Current: {LOF_THRESHOLD:.4f}, Calculated: {calculated_lof:.4f}")
             except Exception as e:
                 print(f"⚠️ Error calculating LOF threshold: {e}")
         
@@ -495,67 +513,24 @@ class OnlineDetectorRPi:
             try:
                 copod_scores = self.models['copod'].decision_function(X_train)
                 calculated_copod = np.percentile(copod_scores, (1 - contamination_rate) * 100)
-                print(f"COPOD - Current: {self.adaptive_thresholds['copod']:.4f}, Calculated: {calculated_copod:.4f}")
-                # Update threshold
-                self.adaptive_thresholds['copod'] = calculated_copod
-                global COPOD_THRESHOLD
-                COPOD_THRESHOLD = calculated_copod
-                print(f"COPOD threshold updated to {calculated_copod:.4f}")
+                print(f"COPOD - Current: {COPOD_THRESHOLD:.4f}, Calculated: {calculated_copod:.4f}")
             except Exception as e:
                 print(f"⚠️ Error calculating COPOD threshold: {e}")
         
         print("=== Initial Threshold Calculation Complete ===\n")
 
-    def update_adaptive_thresholds(self):
-        """Update adaptive thresholds based on recent scores"""
-        if not ADAPTIVE_THRESHOLD_ENABLED:
-            return
-            
-        self.sample_count_since_update += 1
-        
-        # Only update after collecting enough samples
-        if self.sample_count_since_update < ADAPTIVE_UPDATE_FREQ:
-            return
-            
-        # Reset counter
-        self.sample_count_since_update = 0
-        
-        # Update each threshold based on recent scores
-        for algo, scores in self.score_history.items():
-            if len(scores) < ADAPTIVE_WINDOW_SIZE // 2:  # Need at least half the window size
-                continue
-                
-            # Calculate new threshold based on percentile
-            if algo == 'hst' or algo == 'copod':  # Higher values are anomalous
-                new_threshold = np.percentile(list(scores), ADAPTIVE_PERCENTILE)
-            else:  # ocsvm, lof - lower values are anomalous
-                new_threshold = np.percentile(list(scores), 100 - ADAPTIVE_PERCENTILE)
-                
-            # Apply smoothing
-            current = self.adaptive_thresholds[algo]
-            updated = current * ADAPTIVE_SMOOTHING + new_threshold * (1 - ADAPTIVE_SMOOTHING)
-            self.adaptive_thresholds[algo] = updated
-            
-            # Update global variable
-            global HST_THRESHOLD, OCSVM_THRESHOLD, LOF_THRESHOLD, COPOD_THRESHOLD
-            if algo == 'hst':
-                HST_THRESHOLD = updated
-            elif algo == 'ocsvm':
-                OCSVM_THRESHOLD = updated
-            elif algo == 'lof':
-                LOF_THRESHOLD = updated
-            elif algo == 'copod':
-                COPOD_THRESHOLD = updated
-                
-            print(f"Adaptive {algo.upper()} threshold updated: {current:.4f} -> {updated:.4f}")
-    
     def detect(self, records, X_scaled):
         """Process flows and evaluate each individually"""
         
         # HST detection (stream processing)
         for i, (key5t, src_mac, dst_mac, features) in enumerate(records):
             now = datetime.now()
-            gt_attack = (src_mac == self.attacker_mac and dst_mac == self.camera_mac)
+            # Ground truth: Consider traffic as attack if it involves attacker and camera
+            # This includes both attacker->camera and camera->attacker (responses)
+            gt_attack = (
+                (src_mac == self.attacker_mac and dst_mac == self.camera_mac) or
+                (src_mac == self.camera_mac and dst_mac == self.attacker_mac)
+            )
             
             # Store sample for threshold updates
             sample_data = {
@@ -583,11 +558,39 @@ class OnlineDetectorRPi:
                 # Update HST with the sample
                 self.hst.learn_one(feature_dict)
 
-                if score > self.adaptive_thresholds['hst']:
-                    self.evaluator.note_alert(now, gt_attack=gt_attack, algorithm='HalfSpaceTrees')
-                    log_anomaly(key5t, features, score, "HalfSpaceTrees")
-                    if not gt_attack:
-                        log_misclassified_benign(key5t, features, score, "HalfSpaceTrees")
+                if score > HST_THRESHOLD:
+                    # Check deny list if enabled
+                    if self.enable_denylist:
+                        src_ip, dst_ip, proto, src_port, dst_port = key5t
+                        denylist_result = self.denylist.check_ip(src_ip, dst_ip, src_port, dst_port)
+                        
+                        # Whitelist network functionality traffic
+                        if denylist_result['is_network_function']:
+                            self.evaluator.note_no_alert(now, gt_attack=gt_attack, algorithm='HalfSpaceTrees')
+                            if gt_attack:
+                                log_missed_anomaly(key5t, features, score, "HalfSpaceTrees")
+                            continue
+                        
+                        # Only log anomaly if deny list confirms it OR if not in public-not-in-denylist case
+                        if denylist_result['should_flag']:
+                            self.evaluator.note_alert(now, gt_attack=gt_attack, algorithm='HalfSpaceTrees')
+                            reason = denylist_result['reason']
+                            print(f"✓ CONFIRMED anomaly (HST) - {reason}: {key5t} (score={score:.3f})")
+                            log_anomaly(key5t, features, score, "HalfSpaceTrees")
+                            if not gt_attack:
+                                log_misclassified_benign(key5t, features, score, "HalfSpaceTrees")
+                        else:
+                            # Suppressed - public IP not in deny list
+                            self.evaluator.note_no_alert(now, gt_attack=gt_attack, algorithm='HalfSpaceTrees')
+                            print(f"✗ SUPPRESSED anomaly (HST) - {denylist_result['reason']}: {key5t}")
+                            if gt_attack:
+                                log_missed_anomaly(key5t, features, score, "HalfSpaceTrees")
+                    else:
+                        # Deny list disabled, use standard detection
+                        self.evaluator.note_alert(now, gt_attack=gt_attack, algorithm='HalfSpaceTrees')
+                        log_anomaly(key5t, features, score, "HalfSpaceTrees")
+                        if not gt_attack:
+                            log_misclassified_benign(key5t, features, score, "HalfSpaceTrees")
                 else:
                     self.evaluator.note_no_alert(now, gt_attack=gt_attack, algorithm='HalfSpaceTrees')
                     if gt_attack:
@@ -605,11 +608,37 @@ class OnlineDetectorRPi:
                     score = self.models['ocsvm'].decision_function(x)[0]
                     self.score_history['ocsvm'].append(score)
                     
-                    if score < self.adaptive_thresholds['ocsvm']:
-                        self.evaluator.note_alert(now, gt_attack=gt_attack, algorithm='OC-SVM')
-                        log_anomaly(key5t, features, score, "OCSVM")
-                        if not gt_attack:
-                            log_misclassified_benign(key5t, features, score, "OCSVM")
+                    if score < OCSVM_THRESHOLD:
+                        # Check deny list if enabled
+                        if self.enable_denylist:
+                            src_ip, dst_ip, proto, src_port, dst_port = key5t
+                            denylist_result = self.denylist.check_ip(src_ip, dst_ip, src_port, dst_port)
+                            
+                            # Whitelist network functionality traffic
+                            if denylist_result['is_network_function']:
+                                self.evaluator.note_no_alert(now, gt_attack=gt_attack, algorithm='OC-SVM')
+                                if gt_attack:
+                                    log_missed_anomaly(key5t, features, score, "OCSVM")
+                                continue
+                            
+                            if denylist_result['should_flag']:
+                                self.evaluator.note_alert(now, gt_attack=gt_attack, algorithm='OC-SVM')
+                                reason = denylist_result['reason']
+                                print(f"✓ CONFIRMED anomaly (OC-SVM) - {reason}: {key5t} (score={score:.3f})")
+                                log_anomaly(key5t, features, score, "OCSVM")
+                                if not gt_attack:
+                                    log_misclassified_benign(key5t, features, score, "OCSVM")
+                            else:
+                                self.evaluator.note_no_alert(now, gt_attack=gt_attack, algorithm='OC-SVM')
+                                print(f"✗ SUPPRESSED anomaly (OC-SVM) - {denylist_result['reason']}: {key5t}")
+                                if gt_attack:
+                                    log_missed_anomaly(key5t, features, score, "OCSVM")
+                        else:
+                            # Deny list disabled
+                            self.evaluator.note_alert(now, gt_attack=gt_attack, algorithm='OC-SVM')
+                            log_anomaly(key5t, features, score, "OCSVM")
+                            if not gt_attack:
+                                log_misclassified_benign(key5t, features, score, "OCSVM")
                     else:
                         self.evaluator.note_no_alert(now, gt_attack=gt_attack, algorithm='OC-SVM')
                         if gt_attack:
@@ -624,11 +653,37 @@ class OnlineDetectorRPi:
                     score = self.models['lof'].decision_function(x)[0]
                     self.score_history['lof'].append(score)
                     
-                    if score < self.adaptive_thresholds['lof']:
-                        self.evaluator.note_alert(now, gt_attack=gt_attack, algorithm='LOF')
-                        log_anomaly(key5t, features, score, "LOF")
-                        if not gt_attack:
-                            log_misclassified_benign(key5t, features, score, "LOF")
+                    if score < LOF_THRESHOLD:
+                        # Check deny list if enabled
+                        if self.enable_denylist:
+                            src_ip, dst_ip, proto, src_port, dst_port = key5t
+                            denylist_result = self.denylist.check_ip(src_ip, dst_ip, src_port, dst_port)
+                            
+                            # Whitelist network functionality traffic
+                            if denylist_result['is_network_function']:
+                                self.evaluator.note_no_alert(now, gt_attack=gt_attack, algorithm='LOF')
+                                if gt_attack:
+                                    log_missed_anomaly(key5t, features, score, "LOF")
+                                continue
+                            
+                            if denylist_result['should_flag']:
+                                self.evaluator.note_alert(now, gt_attack=gt_attack, algorithm='LOF')
+                                reason = denylist_result['reason']
+                                print(f"✓ CONFIRMED anomaly (LOF) - {reason}: {key5t} (score={score:.3f})")
+                                log_anomaly(key5t, features, score, "LOF")
+                                if not gt_attack:
+                                    log_misclassified_benign(key5t, features, score, "LOF")
+                            else:
+                                self.evaluator.note_no_alert(now, gt_attack=gt_attack, algorithm='LOF')
+                                print(f"✗ SUPPRESSED anomaly (LOF) - {denylist_result['reason']}: {key5t}")
+                                if gt_attack:
+                                    log_missed_anomaly(key5t, features, score, "LOF")
+                        else:
+                            # Deny list disabled
+                            self.evaluator.note_alert(now, gt_attack=gt_attack, algorithm='LOF')
+                            log_anomaly(key5t, features, score, "LOF")
+                            if not gt_attack:
+                                log_misclassified_benign(key5t, features, score, "LOF")
                     else:
                         self.evaluator.note_no_alert(now, gt_attack=gt_attack, algorithm='LOF')
                         if gt_attack:
@@ -643,20 +698,43 @@ class OnlineDetectorRPi:
                     score = self.models['copod'].decision_function(x)[0]
                     self.score_history['copod'].append(score)
                     
-                    if score > self.adaptive_thresholds['copod']:
-                        self.evaluator.note_alert(now, gt_attack=gt_attack, algorithm='COPOD')
-                        log_anomaly(key5t, features, score, "COPOD")
-                        if not gt_attack:
-                            log_misclassified_benign(key5t, features, score, "COPOD")
+                    if score > COPOD_THRESHOLD:
+                        # Check deny list if enabled
+                        if self.enable_denylist:
+                            src_ip, dst_ip, proto, src_port, dst_port = key5t
+                            denylist_result = self.denylist.check_ip(src_ip, dst_ip, src_port, dst_port)
+                            
+                            # Whitelist network functionality traffic
+                            if denylist_result['is_network_function']:
+                                self.evaluator.note_no_alert(now, gt_attack=gt_attack, algorithm='COPOD')
+                                if gt_attack:
+                                    log_missed_anomaly(key5t, features, score, "COPOD")
+                                continue
+                            
+                            if denylist_result['should_flag']:
+                                self.evaluator.note_alert(now, gt_attack=gt_attack, algorithm='COPOD')
+                                reason = denylist_result['reason']
+                                print(f"✓ CONFIRMED anomaly (COPOD) - {reason}: {key5t} (score={score:.3f})")
+                                log_anomaly(key5t, features, score, "COPOD")
+                                if not gt_attack:
+                                    log_misclassified_benign(key5t, features, score, "COPOD")
+                            else:
+                                self.evaluator.note_no_alert(now, gt_attack=gt_attack, algorithm='COPOD')
+                                print(f"✗ SUPPRESSED anomaly (COPOD) - {denylist_result['reason']}: {key5t}")
+                                if gt_attack:
+                                    log_missed_anomaly(key5t, features, score, "COPOD")
+                        else:
+                            # Deny list disabled
+                            self.evaluator.note_alert(now, gt_attack=gt_attack, algorithm='COPOD')
+                            log_anomaly(key5t, features, score, "COPOD")
+                            if not gt_attack:
+                                log_misclassified_benign(key5t, features, score, "COPOD")
                     else:
                         self.evaluator.note_no_alert(now, gt_attack=gt_attack, algorithm='COPOD')
                         if gt_attack:
                             log_missed_anomaly(key5t, features, score, "COPOD")
                 except Exception as e:
                     print(f"⚠️ COPOD scoring error: {e}")
-                    
-            # Update adaptive thresholds after processing each sample
-            self.update_adaptive_thresholds()
 
     def process_batch(self):
         """Process current batch of flows"""
@@ -670,17 +748,19 @@ class OnlineDetectorRPi:
         for key5t, stats in list(self.flow_stats.items()):
             duration = stats['last_seen'] - stats['first_seen']
             
-            # Skip flows that are too short
-            if duration < MIN_FLOW_DURATION:
-                continue
-                
             # Extract features
             features = self.extract_features(stats)
             
-            # Send to MacBook for DL processing
+            # ALWAYS send to MacBook for DL processing (regardless of duration)
+            # DL models can learn from short flows too
             self.send_to_macbook(key5t, stats['src_mac'], stats['dst_mac'], features)
             
-            # Add to batch records
+            # Skip flows that are too short for LOCAL detection only
+            # Still sent to DL server above
+            if duration < MIN_FLOW_DURATION:
+                continue
+            
+            # Add to batch records for LOCAL RPi detection
             records.append((key5t, stats['src_mac'], stats['dst_mac'], features))
             X.append([features[f] for f in FEATURES])
                 
@@ -741,33 +821,6 @@ class OnlineDetectorRPi:
         # Supervised approach: Use ground truth labels
         supervised_thresholds = self.compute_supervised_thresholds(contamination_rate)
         
-        # Apply supervised thresholds to adaptive thresholds
-        # Supervised takes precedence over unsupervised when available
-        global HST_THRESHOLD, OCSVM_THRESHOLD, LOF_THRESHOLD, COPOD_THRESHOLD
-        
-        for algo in ['hst', 'ocsvm', 'lof', 'copod']:
-            if len(self.recent_samples) > 200:
-                # Use supervised when we have enough data
-                new_threshold = supervised_thresholds[algo]
-                print(f"Updating {algo} threshold using supervised approach: {self.adaptive_thresholds[algo]:.6f} -> {new_threshold:.6f}")
-            else:
-                # Fall back to unsupervised when we don't have enough labeled data
-                new_threshold = unsupervised_thresholds[algo]
-                print(f"Updating {algo} threshold using unsupervised approach: {self.adaptive_thresholds[algo]:.6f} -> {new_threshold:.6f}")
-                
-            # Apply smoothing
-            self.adaptive_thresholds[algo] = self.adaptive_thresholds[algo] * ADAPTIVE_SMOOTHING + new_threshold * (1 - ADAPTIVE_SMOOTHING)
-            
-            # Update global variables for backwards compatibility
-            if algo == 'hst':
-                HST_THRESHOLD = self.adaptive_thresholds[algo]
-            elif algo == 'ocsvm':
-                OCSVM_THRESHOLD = self.adaptive_thresholds[algo]
-            elif algo == 'lof':
-                LOF_THRESHOLD = self.adaptive_thresholds[algo]
-            elif algo == 'copod':
-                COPOD_THRESHOLD = self.adaptive_thresholds[algo]
-        
         # Log unsupervised thresholds (append to the freshly created file)
         with open(self.unsupervised_threshold_log, 'a') as f:
             f.write(f"{timestamp},{unsupervised_thresholds['hst']:.6f},{unsupervised_thresholds['ocsvm']:.6f},{unsupervised_thresholds['lof']:.6f},{unsupervised_thresholds['copod']:.6f}\n")
@@ -775,10 +828,6 @@ class OnlineDetectorRPi:
         # Log supervised thresholds (append to the freshly created file)
         with open(self.supervised_threshold_log, 'a') as f:
             f.write(f"{timestamp},{supervised_thresholds['hst']:.6f},{supervised_thresholds['ocsvm']:.6f},{supervised_thresholds['lof']:.6f},{supervised_thresholds['copod']:.6f}\n")
-        
-        # Log current adaptive thresholds
-        with open("thresholds_adaptive_rpi.log", 'a') as f:
-            f.write(f"{timestamp},{self.adaptive_thresholds['hst']:.6f},{self.adaptive_thresholds['ocsvm']:.6f},{self.adaptive_thresholds['lof']:.6f},{self.adaptive_thresholds['copod']:.6f}\n")
         
         print(f"Thresholds computed and saved at {timestamp}")
         print("=== Threshold Update Complete ===\n")
@@ -791,33 +840,33 @@ class OnlineDetectorRPi:
         if len(self.score_history['hst']) > 100:
             scores = list(self.score_history['hst'])
             thresholds['hst'] = np.percentile(scores, contamination_rate * 100)
-            print(f"Unsupervised HST threshold: {thresholds['hst']:.6f} (current: {self.adaptive_thresholds['hst']:.6f})")
+            print(f"Unsupervised HST threshold: {thresholds['hst']:.6f} (current: {HST_THRESHOLD:.6f})")
         else:
-            thresholds['hst'] = self.adaptive_thresholds['hst']
+            thresholds['hst'] = HST_THRESHOLD
         
         # OC-SVM threshold
         if len(self.score_history['ocsvm']) > 100:
             scores = list(self.score_history['ocsvm'])
             thresholds['ocsvm'] = np.percentile(scores, contamination_rate * 100)
-            print(f"Unsupervised OC-SVM threshold: {thresholds['ocsvm']:.6f} (current: {self.adaptive_thresholds['ocsvm']:.6f})")
+            print(f"Unsupervised OC-SVM threshold: {thresholds['ocsvm']:.6f} (current: {OCSVM_THRESHOLD:.6f})")
         else:
-            thresholds['ocsvm'] = self.adaptive_thresholds['ocsvm']
+            thresholds['ocsvm'] = OCSVM_THRESHOLD
         
         # LOF threshold
         if len(self.score_history['lof']) > 100:
             scores = list(self.score_history['lof'])
             thresholds['lof'] = np.percentile(scores, contamination_rate * 100)
-            print(f"Unsupervised LOF threshold: {thresholds['lof']:.6f} (current: {self.adaptive_thresholds['lof']:.6f})")
+            print(f"Unsupervised LOF threshold: {thresholds['lof']:.6f} (current: {LOF_THRESHOLD:.6f})")
         else:
-            thresholds['lof'] = self.adaptive_thresholds['lof']
+            thresholds['lof'] = LOF_THRESHOLD
         
         # COPOD threshold
         if len(self.score_history['copod']) > 100:
             scores = list(self.score_history['copod'])
             thresholds['copod'] = np.percentile(scores, (1 - contamination_rate) * 100)
-            print(f"Unsupervised COPOD threshold: {thresholds['copod']:.6f} (current: {self.adaptive_thresholds['copod']:.6f})")
+            print(f"Unsupervised COPOD threshold: {thresholds['copod']:.6f} (current: {COPOD_THRESHOLD:.6f})")
         else:
-            thresholds['copod'] = self.adaptive_thresholds['copod']
+            thresholds['copod'] = COPOD_THRESHOLD
         
         return thresholds
 
@@ -831,10 +880,10 @@ class OnlineDetectorRPi:
         if len(benign_samples) < 50:
             print("Not enough benign samples for supervised threshold calculation")
             return {
-                'hst': self.adaptive_thresholds['hst'],
-                'ocsvm': self.adaptive_thresholds['ocsvm'],
-                'lof': self.adaptive_thresholds['lof'],
-                'copod': self.adaptive_thresholds['copod']
+                'hst': HST_THRESHOLD,
+                'ocsvm': OCSVM_THRESHOLD,
+                'lof': LOF_THRESHOLD,
+                'copod': COPOD_THRESHOLD
             }
         
         # Extract features for benign samples
@@ -850,36 +899,36 @@ class OnlineDetectorRPi:
         
         if hst_scores_benign:
             thresholds['hst'] = np.percentile(hst_scores_benign, contamination_rate * 100)
-            print(f"Supervised HST threshold: {thresholds['hst']:.6f} (current: {self.adaptive_thresholds['hst']:.6f})")
+            print(f"Supervised HST threshold: {thresholds['hst']:.6f} (current: {HST_THRESHOLD:.6f})")
         else:
-            thresholds['hst'] = self.adaptive_thresholds['hst']
+            thresholds['hst'] = HST_THRESHOLD
         
         # OC-SVM threshold on benign samples
         try:
             ocsvm_scores = self.models['ocsvm'].decision_function(X_benign_scaled)
             thresholds['ocsvm'] = np.percentile(ocsvm_scores, contamination_rate * 100)
-            print(f"Supervised OC-SVM threshold: {thresholds['ocsvm']:.6f} (current: {self.adaptive_thresholds['ocsvm']:.6f})")
+            print(f"Supervised OC-SVM threshold: {thresholds['ocsvm']:.6f} (current: {OCSVM_THRESHOLD:.6f})")
         except Exception as e:
             print(f"⚠️ Error computing supervised OC-SVM threshold: {e}")
-            thresholds['ocsvm'] = self.adaptive_thresholds['ocsvm']
+            thresholds['ocsvm'] = OCSVM_THRESHOLD
         
         # LOF threshold on benign samples
         try:
             lof_scores = self.models['lof'].decision_function(X_benign_scaled)
             thresholds['lof'] = np.percentile(lof_scores, contamination_rate * 100)
-            print(f"Supervised LOF threshold: {thresholds['lof']:.6f} (current: {self.adaptive_thresholds['lof']:.6f})")
+            print(f"Supervised LOF threshold: {thresholds['lof']:.6f} (current: {LOF_THRESHOLD:.6f})")
         except Exception as e:
             print(f"⚠️ Error computing supervised LOF threshold: {e}")
-            thresholds['lof'] = self.adaptive_thresholds['lof']
+            thresholds['lof'] = LOF_THRESHOLD
         
         # COPOD threshold on benign samples
         try:
             copod_scores = self.models['copod'].decision_function(X_benign_scaled)
             thresholds['copod'] = np.percentile(copod_scores, (1 - contamination_rate) * 100)
-            print(f"Supervised COPOD threshold: {thresholds['copod']:.6f} (current: {self.adaptive_thresholds['copod']:.6f})")
+            print(f"Supervised COPOD threshold: {thresholds['copod']:.6f} (current: {COPOD_THRESHOLD:.6f})")
         except Exception as e:
             print(f"⚠️ Error computing supervised COPOD threshold: {e}")
-            thresholds['copod'] = self.adaptive_thresholds['copod']
+            thresholds['copod'] = COPOD_THRESHOLD
         
         return thresholds
 
@@ -1102,7 +1151,10 @@ def get_args():
     parser.add_argument('--metrics-interval', type=int, default=300, help='Metrics save interval (seconds)')
     parser.add_argument('--learning-window', type=int, default=LEARNING_WINDOW_DEFAULT, 
                         help=f'Learning phase duration in seconds (default: {LEARNING_WINDOW_DEFAULT}s)')
-    parser.add_argument('--debug', action='store_true', help='Enable verbose debug logging')
+    parser.add_argument('--denylist-file', type=str, default=None,
+                        help='Path to AbuseIPDB deny list CSV file (format: ip,country_code,abuse_confidence_score,last_reported_at)')
+    parser.add_argument('--router-ip', type=str, default=None,
+                        help='Router IP address for whitelisting network functionality traffic (DHCP, DNS)')
     return parser.parse_args()
 
 

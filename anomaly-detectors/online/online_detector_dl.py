@@ -32,6 +32,12 @@ def parse_args():
     p.add_argument("--camera-mac", required=True)
     p.add_argument("--batch-train-every", type=int, default=50)
     p.add_argument("--debug", action="store_true", help="Enable verbose debug logging")
+    p.add_argument("--adaptive-thresholds", action="store_true", 
+                   help="Enable adaptive thresholds (default: use static thresholds)")
+    p.add_argument("--denylist-file", type=str, default=None,
+                   help="Path to AbuseIPDB deny list CSV file")
+    p.add_argument("--router-ip", type=str, default=None,
+                   help="Router IP address for whitelisting network functionality traffic")
     return p.parse_args()
 
 args = parse_args()
@@ -40,6 +46,28 @@ ATTACKER_MAC = args.attacker_mac.lower()
 CAMERA_MAC = args.camera_mac.lower()
 BATCH_TRAIN_EVERY = args.batch_train_every
 DEBUG = args.debug  # Global debug flag
+USE_ADAPTIVE_THRESHOLDS = args.adaptive_thresholds
+
+# -------------------------
+# Static Thresholds (used when adaptive thresholds are disabled)
+# -------------------------
+STATIC_THRESHOLDS = {
+    "VAE": 0.01,      # Recalibrated for normalized features (was 15.552058)
+    "LSTM": 0.01,     # Recalibrated for normalized features (was 10.902546)
+    "GRU": 0.01       # Recalibrated for normalized features (was 8.423924)
+}
+# NOTE: These thresholds work with normalized features (0-1 range).
+# The old thresholds (8-15) were calibrated for unnormalized data.
+# After warm-up, monitor performance and adjust if needed:
+# - If FPR too high: increase thresholds (e.g., 0.05)
+# - If recall too low: decrease thresholds (e.g., 0.005)
+
+# Network functionality protocols that should always be allowed
+ALLOWED_NETWORK_PROTOCOLS = {
+    67,   # DHCP server
+    68,   # DHCP client
+    53,   # DNS
+}
 
 # -------------------------
 # Logs & metrics
@@ -62,6 +90,206 @@ def info_log(message):
     """Print important info messages regardless of debug setting"""
     print(message)
 
+# -------------------------
+# AbuseIPDB Deny List Integration
+# -------------------------
+class AbuseIPDBDenyList:
+    """
+    Handles IP reputation checking using a local AbuseIPDB deny list CSV file.
+    CSV format: ip,country_code,abuse_confidence_score,last_reported_at
+    
+    Logic:
+    - If IP is in deny list: Flag as malicious (confirmed anomaly)
+    - If IP is private/local: Flag as suspicious (confirmed anomaly)
+    - If IP is public but not in deny list: Don't flag (likely false positive)
+    - Network functionality traffic (DHCP, DNS to router): Always whitelist
+    """
+    
+    def __init__(self, denylist_file=None, router_ip=None):
+        self.denylist_file = denylist_file
+        self.router_ip = router_ip
+        self.enabled = bool(denylist_file)
+        self.deny_list = {}  # {ip: {'country_code': str, 'score': int, 'last_reported': str}}
+        
+        if self.enabled:
+            self.load_denylist()
+        else:
+            info_log("AbuseIPDB Deny List: DISABLED (no file specified)")
+    
+    def load_denylist(self):
+        """Load AbuseIPDB deny list from CSV file"""
+        try:
+            if not os.path.exists(self.denylist_file):
+                info_log(f"⚠️  Deny list file not found: {self.denylist_file}")
+                self.enabled = False
+                return
+            
+            import csv
+            with open(self.denylist_file, 'r') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    ip = row['ip'].strip()
+                    self.deny_list[ip] = {
+                        'country_code': row.get('country_code', '').strip(),
+                        'score': int(row.get('abuse_confidence_score', 0)),
+                        'last_reported': row.get('last_reported_at', '').strip()
+                    }
+            
+            info_log(f"AbuseIPDB Deny List: ENABLED")
+            info_log(f"  File: {self.denylist_file}")
+            info_log(f"  Loaded {len(self.deny_list)} malicious IPs")
+            if self.router_ip:
+                info_log(f"  Router IP: {self.router_ip} (whitelisted for network functionality)")
+        
+        except Exception as e:
+            info_log(f"⚠️  Error loading deny list: {e}")
+            self.enabled = False
+            self.deny_list = {}
+    
+    def is_network_functionality(self, src_ip, dst_ip, src_port, dst_port):
+        """
+        Check if traffic is network functionality (DHCP, DNS to router).
+        These should always be allowed regardless of anomaly detection.
+        
+        IMPORTANT: Be very specific to avoid whitelisting attack traffic!
+        - DHCP: Only whitelist if BOTH IPs are in expected ranges
+        - DNS: Only whitelist if destination is the router
+        """
+        # DHCP traffic (ports 67/68)
+        # Only whitelist if it's actual DHCP communication (server:67, client:68)
+        if (src_port == 67 and dst_port == 68) or (src_port == 68 and dst_port == 67):
+            return True, "DHCP"
+        
+        # DNS to router (port 53)
+        # Only whitelist if destination is router and port is 53
+        # Do NOT whitelist if source port is 53 (that could be spoofed)
+        if self.router_ip and dst_ip == self.router_ip and dst_port == 53:
+            return True, "DNS_to_router"
+        
+        return False, None
+    
+    def check_ip(self, src_ip, dst_ip, src_port, dst_port):
+        """
+        Check IP against deny list and private IP ranges.
+        
+        IMPORTANT: We check the REMOTE IP (the endpoint the camera is communicating with).
+        
+        Returns dict with:
+        - in_denylist: bool (IP is in AbuseIPDB deny list)
+        - is_private: bool (Remote IP is in private/local range)
+        - is_network_function: bool (DHCP, DNS to router)
+        - should_flag: bool (True if anomaly should be confirmed)
+        - reason: str (explanation)
+        - score: int (abuse confidence score if in deny list)
+        """
+        result = {
+            'in_denylist': False,
+            'is_private': False,
+            'is_network_function': False,
+            'should_flag': False,
+            'reason': 'unknown',
+            'score': 0,
+            'country_code': '',
+            'remote_ip': None
+        }
+        
+        # Check if this is network functionality traffic (always whitelist)
+        is_net_func, func_type = self.is_network_functionality(src_ip, dst_ip, src_port, dst_port)
+        if is_net_func:
+            result['is_network_function'] = True
+            result['should_flag'] = False
+            result['reason'] = f'network_functionality_{func_type}'
+            return result
+        
+        # Determine remote IP (the endpoint the camera is communicating with)
+        # The camera is typically on a private IP (10.x, 192.168.x, etc.)
+        # We want to check the reputation of the OTHER endpoint (public internet IP)
+        
+        src_is_private = self.is_private_ip(src_ip)
+        dst_is_private = self.is_private_ip(dst_ip)
+        
+        # Determine which IP is the "remote endpoint" to check
+        if src_is_private and not dst_is_private:
+            # Traffic from camera (private) to internet (public)
+            # Check the destination (remote server)
+            remote_ip = dst_ip
+            result['remote_ip'] = remote_ip
+        elif not src_is_private and dst_is_private:
+            # Traffic from internet (public) to camera (private)
+            # Check the source (remote server)
+            remote_ip = src_ip
+            result['remote_ip'] = remote_ip
+        elif src_is_private and dst_is_private:
+            # Both private - suspicious local network communication
+            # This could be lateral movement or local attacks
+            result['is_private'] = True
+            result['should_flag'] = True
+            result['reason'] = 'private_to_private'
+            result['remote_ip'] = f"both_private_{src_ip}_to_{dst_ip}"
+            return result
+        else:
+            # Both public - unusual for IoT camera, but check destination
+            remote_ip = dst_ip
+            result['remote_ip'] = remote_ip
+        
+        # At this point, remote_ip is the public endpoint to validate
+        # If deny list is disabled, don't flag legitimate public IPs
+        if not self.enabled:
+            result['reason'] = 'public_ip_no_denylist_check'
+            result['should_flag'] = False
+            return result
+        
+        # Check if remote IP is in the deny list
+        if remote_ip in self.deny_list:
+            entry = self.deny_list[remote_ip]
+            result['in_denylist'] = True
+            result['should_flag'] = True
+            result['reason'] = 'in_denylist'
+            result['score'] = entry['score']
+            result['country_code'] = entry['country_code']
+            info_log(f"🚨 Remote IP {remote_ip} found in deny list (score: {entry['score']}, country: {entry['country_code']})")
+            return result
+        
+        # Remote IP is public but NOT in deny list
+        # This is likely a legitimate cloud service (DNS, API, streaming, etc.)
+        # Suppress the anomaly
+        result['reason'] = 'public_ip_not_in_denylist'
+        result['should_flag'] = False
+        debug_log(f"✓ Remote IP {remote_ip} not in deny list - likely legitimate (suppressing anomaly)")
+        return result
+    
+    def is_private_ip(self, ip):
+        """Check if IP is in private/local range"""
+        try:
+            parts = list(map(int, ip.split('.')))
+            
+            # Private IP ranges:
+            # 10.0.0.0/8
+            if parts[0] == 10:
+                return True
+            # 172.16.0.0/12
+            if parts[0] == 172 and 16 <= parts[1] <= 31:
+                return True
+            # 192.168.0.0/16
+            if parts[0] == 192 and parts[1] == 168:
+                return True
+            # 127.0.0.0/8 (loopback)
+            if parts[0] == 127:
+                return True
+            # Link-local 169.254.0.0/16
+            if parts[0] == 169 and parts[1] == 254:
+                return True
+            
+            return False
+        except:
+            return False
+
+# Initialize deny list
+denylist = AbuseIPDBDenyList(
+    denylist_file=args.denylist_file,
+    router_ip=args.router_ip
+)
+
 metrics = {"VAE": Counter(), "LSTM": Counter(), "GRU": Counter()}
 
 # -------------------------
@@ -73,8 +301,8 @@ ADAPTIVE_PERCENTILE = 99       # Percentile to use for threshold calculation (hi
 ADAPTIVE_UPDATE_FREQ = 50      # Update threshold every N samples
 ADAPTIVE_SMOOTHING = 0.9       # Smoothing factor (higher = slower adaptation)
 
-# Initial thresholds
-INIT_THRESHOLDS = {"VAE": 0.1, "LSTM": 0.1, "GRU": 0.1}
+# Initial thresholds (use static thresholds as starting point)
+INIT_THRESHOLDS = STATIC_THRESHOLDS.copy()
 
 # Score buffers for benign samples (for threshold adaptation)
 score_buffers = {m: deque(maxlen=ADAPTIVE_WINDOW_SIZE) for m in ["VAE", "LSTM", "GRU"]}
@@ -107,6 +335,24 @@ gru_opt = optimizers.Adam(1e-3)
 buffers = {"VAE": [], "LSTM": [], "GRU": []}
 accepted_since_train = {"VAE": 0, "LSTM": 0, "GRU": 0}
 pre_init_buffer = []
+
+# Connection monitoring
+connection_established = False
+first_message_received = False
+connection_time = None
+first_message_time = None
+
+# Warm-up mode: Train on all data for the first N minutes regardless of anomaly score
+WARMUP_DURATION_MINUTES = 5  # Train on everything for first 5 minutes to bootstrap models
+warmup_start_time = None  # Will be set when models are initialized
+warmup_complete = {"VAE": False, "LSTM": False, "GRU": False}
+
+# Feature normalization statistics (computed during training)
+feature_stats = {
+    "VAE": {"min": None, "range": None},
+    "LSTM": {"min": None, "range": None},
+    "GRU": {"min": None, "range": None}
+}
 
 # Try to load existing thresholds
 def load_existing_thresholds():
@@ -192,45 +438,132 @@ def build_gru_forecaster(input_dim, seq_len=1, hidden=16):
 # -------------------------
 # Score functions
 # -------------------------
+def normalize_features(x, model_name):
+    """Normalize features using saved statistics from training"""
+    # Always convert to numpy array first
+    x_arr = np.array(x, dtype=np.float32)
+    
+    # Check for nan/inf in input features
+    if not np.all(np.isfinite(x_arr)):
+        # Replace nan/inf with 0 to avoid propagating them
+        x_arr = np.nan_to_num(x_arr, nan=0.0, posinf=1e6, neginf=-1e6)
+    
+    if feature_stats[model_name]["min"] is None:
+        # Not trained yet, return unnormalized but as numpy array
+        return x_arr
+    
+    x_min = feature_stats[model_name]["min"]
+    x_range = feature_stats[model_name]["range"]
+    
+    # Compute normalized features
+    x_norm = (x_arr - x_min) / x_range
+    
+    # Final safety check: replace any nan/inf that might have been introduced
+    if not np.all(np.isfinite(x_norm)):
+        x_norm = np.nan_to_num(x_norm, nan=0.0, posinf=1e6, neginf=-1e6)
+    
+    return x_norm
+
 def vae_score(x):
-    x_tf = tf.convert_to_tensor(np.array(x, dtype=np.float32))
+    x_norm = normalize_features(x, "VAE")
+    x_tf = tf.convert_to_tensor(x_norm)
     recon = vae_model(x_tf, training=False)
     return tf.reduce_mean(tf.math.square(recon - x_tf), axis=1).numpy()
 
 def lstm_score(x):
-    x_arr = np.array(x, dtype=np.float32).reshape((-1, 1, INPUT_DIM))
+    x_norm = normalize_features(x, "LSTM")
+    x_arr = x_norm.reshape((-1, 1, INPUT_DIM))
     recon = lstm_model.predict(x_arr, verbose=0).reshape((-1, INPUT_DIM))
-    return np.mean((recon - np.array(x, dtype=np.float32))**2, axis=1)
+    return np.mean((recon - x_norm)**2, axis=1)
 
 def gru_score(x):
-    x_arr = np.array(x, dtype=np.float32).reshape((-1, 1, INPUT_DIM))
+    x_norm = normalize_features(x, "GRU")
+    x_arr = x_norm.reshape((-1, 1, INPUT_DIM))
     pred = gru_model.predict(x_arr, verbose=0)
-    return np.mean((pred - np.array(x, dtype=np.float32))**2, axis=1)
+    return np.mean((pred - x_norm)**2, axis=1)
 
 # -------------------------
 # Training
 # -------------------------
 def train_dl_model(model_name):
+    global vae_model, lstm_model, gru_model, feature_stats
+    
     X = np.array(buffers[model_name], dtype=np.float32)
     if X.shape[0] < 10:
         return
-    if model_name == "VAE":
-        vae_model.compile(optimizer=vae_opt, loss="mse")
-        vae_model.fit(X, X, epochs=3, batch_size=16, verbose=0)
-    elif model_name == "LSTM":
-        seq = X.reshape((-1, 1, X.shape[1]))
-        lstm_model.compile(optimizer=lstm_opt, loss="mse")
-        lstm_model.fit(seq, seq, epochs=3, batch_size=8, verbose=0)
-    elif model_name == "GRU":
-        seq = X.reshape((-1, 1, X.shape[1]))
-        gru_model.compile(optimizer=gru_opt, loss="mse")
-        gru_model.fit(seq, X, epochs=3, batch_size=8, verbose=0)
+    
+    # Check for nan/inf in training data
+    if not np.all(np.isfinite(X)):
+        info_log(f"⚠️ Warning: Training data for {model_name} contains nan/inf values, skipping training")
+        return
+    
+    # Normalize data to prevent numerical instability
+    # Use min-max normalization for stability
+    X_min = np.min(X, axis=0)
+    X_max = np.max(X, axis=0)
+    X_range = X_max - X_min
+    X_range[X_range == 0] = 1.0  # Avoid division by zero
+    X_normalized = (X - X_min) / X_range
+    
+    # Save normalization stats for inference
+    feature_stats[model_name]["min"] = X_min
+    feature_stats[model_name]["range"] = X_range
+    
+    try:
+        if model_name == "VAE":
+            # Save model state before training in case of failure
+            weights_backup = vae_model.get_weights()
+            
+            vae_model.compile(optimizer=vae_opt, loss="mse")
+            history = vae_model.fit(X_normalized, X_normalized, epochs=3, batch_size=16, verbose=0)
+            final_loss = history.history['loss'][-1]
+            
+            # Check if training produced valid loss
+            if not np.isfinite(final_loss):
+                info_log(f"⚠️ {model_name} training produced nan/inf loss, restoring previous weights")
+                vae_model.set_weights(weights_backup)
+                return
+            
+            info_log(f"[TRAIN] {model_name} trained on {X.shape[0]} samples, final loss: {final_loss:.4f}")
+            
+        elif model_name == "LSTM":
+            weights_backup = lstm_model.get_weights()
+            
+            seq = X_normalized.reshape((-1, 1, X_normalized.shape[1]))
+            lstm_model.compile(optimizer=lstm_opt, loss="mse")
+            history = lstm_model.fit(seq, seq, epochs=3, batch_size=8, verbose=0)
+            final_loss = history.history['loss'][-1]
+            
+            if not np.isfinite(final_loss):
+                info_log(f"⚠️ {model_name} training produced nan/inf loss, restoring previous weights")
+                lstm_model.set_weights(weights_backup)
+                return
+            
+            info_log(f"[TRAIN] {model_name} trained on {X.shape[0]} samples, final loss: {final_loss:.4f}")
+            
+        elif model_name == "GRU":
+            weights_backup = gru_model.get_weights()
+            
+            seq = X_normalized.reshape((-1, 1, X_normalized.shape[1]))
+            gru_model.compile(optimizer=gru_opt, loss="mse")
+            history = gru_model.fit(seq, X_normalized, epochs=3, batch_size=8, verbose=0)
+            final_loss = history.history['loss'][-1]
+            
+            if not np.isfinite(final_loss):
+                info_log(f"⚠️ {model_name} training produced nan/inf loss, restoring previous weights")
+                gru_model.set_weights(weights_backup)
+                return
+            
+            info_log(f"[TRAIN] {model_name} trained on {X.shape[0]} samples, final loss: {final_loss:.4f}")
+            
+    except Exception as e:
+        info_log(f"⚠️ Error training {model_name}: {e}")
 
 # -------------------------
 # Processing entries
 # -------------------------
 def process_entry(entry):
-    global initialized, INPUT_DIM, vae_model, lstm_model, gru_model
+    global initialized, INPUT_DIM, vae_model, lstm_model, gru_model, warmup_start_time
 
     # Add debugging to help diagnose issues
     if isinstance(entry, dict):
@@ -298,6 +631,10 @@ def process_entry(entry):
         gru_model = build_gru_forecaster(INPUT_DIM, seq_len=1)
         initialized = True
         
+        # Start warm-up timer
+        warmup_start_time = datetime.now()
+        info_log(f"[WARMUP] Starting {WARMUP_DURATION_MINUTES}-minute warm-up period - training on all data")
+        
         # Process any entries that came in before initialization
         for e in pre_init_buffer:
             process_entry(e)
@@ -331,35 +668,141 @@ def process_entry(entry):
     # Ensure we have the right dimension
     feats = (feature_list + [0.0]*INPUT_DIM)[:INPUT_DIM]
 
-    # Scores
+    # Scores (with protection against nan/inf from untrained models)
     v_score = float(vae_score([feats])[0]) if initialized else 0.0
     l_score = float(lstm_score([feats])[0]) if initialized else 0.0
     g_score = float(gru_score([feats])[0]) if initialized else 0.0
+    
+    # Replace nan/inf with a very high value to treat as anomaly but allow training
+    v_score = v_score if np.isfinite(v_score) else 1e6
+    l_score = l_score if np.isfinite(l_score) else 1e6
+    g_score = g_score if np.isfinite(g_score) else 1e6
+    
     scores = {"VAE": v_score, "LSTM": l_score, "GRU": g_score}
-    gt_anomaly = (src_mac == ATTACKER_MAC and dst_mac == CAMERA_MAC)
+    
+    # Ground truth: Consider traffic as attack if it involves attacker and camera
+    # This includes both attacker->camera and camera->attacker (responses)
+    gt_anomaly = (
+        (src_mac == ATTACKER_MAC and dst_mac == CAMERA_MAC) or
+        (src_mac == CAMERA_MAC and dst_mac == ATTACKER_MAC)
+    )
+    
+    # Extract flow key for deny list checking
+    flow_key = entry.get("flow_key", entry.get("flow_5tuple", None))
+    
+    # Parse flow key if available (format: (src_ip, dst_ip, proto, src_port, dst_port))
+    src_ip, dst_ip, proto, src_port, dst_port = None, None, None, None, None
+    if flow_key and isinstance(flow_key, (tuple, list)) and len(flow_key) >= 5:
+        src_ip, dst_ip, proto, src_port, dst_port = flow_key[0], flow_key[1], flow_key[2], flow_key[3], flow_key[4]
 
     for model_name, score in scores.items():
-        thr = adaptive_thresholds[model_name]
+        # Choose threshold based on mode
+        if USE_ADAPTIVE_THRESHOLDS:
+            thr = adaptive_thresholds[model_name]
+        else:
+            thr = STATIC_THRESHOLDS[model_name]
+            
         is_anom = score > thr
 
-        if is_anom and gt_anomaly:
-            metrics[model_name]["TP"] += 1
-            anomaly_f.write(json.dumps({"timestamp": ts, "model": model_name, "score": score}) + "\n")
-        elif is_anom and not gt_anomaly:
-            metrics[model_name]["FP"] += 1
-            misclass_f.write(json.dumps({"timestamp": ts, "model": model_name, "score": score}) + "\n")
-        elif (not is_anom) and gt_anomaly:
-            metrics[model_name]["FN"] += 1
-            missed_f.write(json.dumps({"timestamp": ts, "model": model_name, "score": score}) + "\n")
+        # Process detection with deny list validation if enabled
+        if is_anom:
+            # ML detected anomaly - now validate with deny list if enabled
+            if denylist.enabled and src_ip is not None:
+                denylist_result = denylist.check_ip(src_ip, dst_ip, src_port, dst_port)
+                
+                # Whitelist network functionality traffic
+                if denylist_result['is_network_function']:
+                    # Suppressed as network functionality
+                    if gt_anomaly:
+                        metrics[model_name]["FN"] += 1
+                        missed_f.write(json.dumps({
+                            "timestamp": ts, 
+                            "model": model_name, 
+                            "score": score,
+                            "reason": denylist_result['reason']
+                        }) + "\n")
+                    else:
+                        metrics[model_name]["TN"] += 1
+                    
+                    # Add score to buffer for threshold calculation
+                    score_buffers[model_name].append(score)
+                    samples_since_update[model_name] += 1
+                    
+                    # CRITICAL FIX #9: Don't skip training during warm-up!
+                    # During warm-up, we need to train on ALL data including network functionality
+                    # to build initial model weights. After warm-up, we can skip these samples.
+                    if warmup_start_time is not None:
+                        elapsed_minutes = (datetime.now() - warmup_start_time).total_seconds() / 60.0
+                        if elapsed_minutes >= WARMUP_DURATION_MINUTES:
+                            # Warm-up complete - skip network functionality for training
+                            continue
+                        # else: Still in warm-up - don't skip, continue to training logic below
+                    else:
+                        # No warm-up timer (shouldn't happen) - skip for safety
+                        continue
+                
+                # Check if anomaly should be confirmed or suppressed
+                if denylist_result['should_flag']:
+                    # Confirmed anomaly (in deny list or private-to-private)
+                    if gt_anomaly:
+                        metrics[model_name]["TP"] += 1
+                    else:
+                        metrics[model_name]["FP"] += 1
+                        misclass_f.write(json.dumps({
+                            "timestamp": ts,
+                            "model": model_name,
+                            "score": score,
+                            "reason": denylist_result['reason']
+                        }) + "\n")
+                    
+                    anomaly_f.write(json.dumps({
+                        "timestamp": ts,
+                        "model": model_name,
+                        "score": score,
+                        "reason": denylist_result['reason'],
+                        "remote_ip": denylist_result.get('remote_ip')
+                    }) + "\n")
+                    
+                    debug_log(f"✓ CONFIRMED anomaly ({model_name}) - {denylist_result['reason']}: score={score:.4f}")
+                else:
+                    # Suppressed (public IP not in deny list)
+                    if gt_anomaly:
+                        metrics[model_name]["FN"] += 1
+                        missed_f.write(json.dumps({
+                            "timestamp": ts,
+                            "model": model_name,
+                            "score": score,
+                            "reason": denylist_result['reason']
+                        }) + "\n")
+                    else:
+                        metrics[model_name]["TN"] += 1
+                    
+                    debug_log(f"✗ SUPPRESSED anomaly ({model_name}) - {denylist_result['reason']}: score={score:.4f}")
+            else:
+                # Deny list disabled or no flow info - use standard detection
+                if gt_anomaly:
+                    metrics[model_name]["TP"] += 1
+                else:
+                    metrics[model_name]["FP"] += 1
+                    misclass_f.write(json.dumps({"timestamp": ts, "model": model_name, "score": score}) + "\n")
+                
+                anomaly_f.write(json.dumps({"timestamp": ts, "model": model_name, "score": score}) + "\n")
         else:
-            metrics[model_name]["TN"] += 1
+            # No anomaly detected
+            if gt_anomaly:
+                metrics[model_name]["FN"] += 1
+                missed_f.write(json.dumps({"timestamp": ts, "model": model_name, "score": score}) + "\n")
+            else:
+                metrics[model_name]["TN"] += 1
 
-        # Add score to buffer for future threshold calculations
-        score_buffers[model_name].append(score)
-        samples_since_update[model_name] += 1
+        # Add score to buffer for adaptive threshold calculations (only if valid)
+        # Filter out nan/inf values that can occur with untrained models
+        if USE_ADAPTIVE_THRESHOLDS and np.isfinite(score):
+            score_buffers[model_name].append(score)
+            samples_since_update[model_name] += 1
         
-        # Update adaptive threshold if we've collected enough samples
-        if samples_since_update[model_name] >= ADAPTIVE_UPDATE_FREQ and len(score_buffers[model_name]) >= ADAPTIVE_WINDOW_SIZE // 2:
+        # Update adaptive threshold if we've collected enough samples (only in adaptive mode)
+        if USE_ADAPTIVE_THRESHOLDS and samples_since_update[model_name] >= ADAPTIVE_UPDATE_FREQ and len(score_buffers[model_name]) >= ADAPTIVE_WINDOW_SIZE // 2:
             # Calculate new threshold from percentile of recent scores
             new_threshold = np.percentile(list(score_buffers[model_name]), ADAPTIVE_PERCENTILE)
             
@@ -387,7 +830,31 @@ def process_entry(entry):
             # Reset the counter
             samples_since_update[model_name] = 0
 
-        if not is_anom:
+        # Training logic: 
+        # - During warm-up (first WARMUP_DURATION_MINUTES), train on ALL samples
+        # - After warm-up, only train on benign samples (not is_anom)
+        should_train = False
+        
+        # Check if we're still in warm-up period
+        if warmup_start_time is not None:
+            elapsed_minutes = (datetime.now() - warmup_start_time).total_seconds() / 60.0
+            
+            if elapsed_minutes < WARMUP_DURATION_MINUTES:
+                # Still in warm-up mode: train on everything
+                should_train = True
+            else:
+                # Warm-up just finished
+                if not warmup_complete[model_name]:
+                    warmup_complete[model_name] = True
+                    info_log(f"[WARMUP] {model_name} completed {WARMUP_DURATION_MINUTES}-minute warm-up phase")
+                # Normal mode: only train on benign samples
+                if not is_anom:
+                    should_train = True
+        elif not is_anom:
+            # Fallback if warmup_start_time not set (shouldn't happen)
+            should_train = True
+        
+        if should_train:
             buffers[model_name].append(feats)
             accepted_since_train[model_name] += 1
             if accepted_since_train[model_name] >= BATCH_TRAIN_EVERY:
@@ -398,28 +865,55 @@ def process_entry(entry):
 # Server
 # -------------------------
 def client_thread(conn):
+    global connection_established, first_message_received, connection_time, first_message_time
+    
     client_addr = conn.getpeername()
     info_log(f"Connection established with client {client_addr}")
+    
+    connection_established = True
+    connection_time = datetime.now()
+    
+    # Set socket timeout to detect stalled connections
+    conn.settimeout(30.0)  # 30 second timeout for receiving data
+    
     with conn:
         buf = b""
         message_count = 0
+        last_message_time = datetime.now()
+        
         try:
             while True:
                 try:
                     data = conn.recv(4096)
                     if not data:
-                        info_log(f"Client {client_addr} disconnected")
+                        info_log(f"Client {client_addr} disconnected (received {message_count} messages)")
                         break
+                    
                     buf += data
+                    last_message_time = datetime.now()
+                    
                     while b"\n" in buf:
                         line, buf = buf.split(b"\n", 1)
                         try:
                             entry = json.loads(line.decode("utf-8"))
                             message_count += 1
                             
+                            # Mark first message received
+                            if message_count == 1:
+                                first_message_received = True
+                                first_message_time = datetime.now()
+                                elapsed = (first_message_time - connection_time).total_seconds()
+                                info_log(f"✅ First message received after {elapsed:.1f}s")
+                            
                             # Log every 50 messages or the first few
                             if message_count <= 5 or message_count % 50 == 0:
-                                debug_log(f"Received message #{message_count} from {client_addr}")
+                                info_log(f"Received message #{message_count} from {client_addr}")
+                            
+                            # Log first message details to help diagnose issues
+                            if message_count == 1:
+                                info_log(f"First message keys: {list(entry.keys())}")
+                                if 'features' in entry:
+                                    info_log(f"Features present: type={type(entry['features']).__name__}")
                             
                             # Check if this is a ping message
                             if entry.get('type') == 'ping':
@@ -434,26 +928,47 @@ def client_thread(conn):
                                 except Exception as e:
                                     debug_log(f"Failed to send ping response: {e}")
                                 continue
-                                
-                            if not initialized:
-                                info_log(f"Models not yet initialized, buffering data")
-                                pre_init_buffer.append(entry)
-                            else:
-                                try:
-                                    process_entry(entry)
-                                except Exception as e:
-                                    info_log(f"Error processing entry: {e}")
-                                    debug_log(f"Entry structure: {entry.keys()}")
-                                    if 'features' in entry:
-                                        debug_log(f"Features type: {type(entry['features']).__name__}")
-                                        if isinstance(entry['features'], dict):
-                                            debug_log(f"Feature keys: {entry['features'].keys()}")
+                            
+                            # Always process entries - process_entry will handle initialization
+                            try:
+                                process_entry(entry)
+                            except Exception as e:
+                                info_log(f"Error processing entry: {e}")
+                                debug_log(f"Entry structure: {entry.keys()}")
+                                if 'features' in entry:
+                                    debug_log(f"Features type: {type(entry['features']).__name__}")
+                                    if isinstance(entry['features'], dict):
+                                        debug_log(f"Feature keys: {entry['features'].keys()}")
                         except json.JSONDecodeError:
                             debug_log(f"Invalid JSON received: {line[:100].decode('utf-8', errors='replace')}...")
                         except Exception as e:
                             debug_log(f"Error processing message: {e}")
+                            
+                except socket.timeout:
+                    # No data received for 30 seconds
+                    elapsed = (datetime.now() - last_message_time).total_seconds()
+                    
+                    # Only warn if we're in critical phases
+                    if message_count == 0:
+                        info_log(f"⚠️ WARNING: No data received from {client_addr} for {elapsed:.0f} seconds")
+                        info_log(f"   Check that RPi detector is running and sending data")
+                        info_log(f"   Expected format: {{'features': {{...}}, 'src_mac': '...', 'dst_mac': '...'}}")
+                    elif not initialized:
+                        info_log(f"⚠️ WARNING: Still waiting for initialization data (received {message_count} messages)")
+                        info_log(f"   Need at least one valid message to initialize models")
+                    elif message_count < 50:
+                        info_log(f"⚠️ WARNING: Low traffic - only {message_count} messages received in {(datetime.now() - connection_time).total_seconds():.0f}s")
+                        info_log(f"   Models need at least 50 samples to train. Continue waiting...")
+                    else:
+                        # After training has started, low traffic is normal
+                        debug_log(f"No data for {elapsed:.0f}s (received {message_count} messages so far)")
+                    
+                    # Continue waiting instead of disconnecting
+                    last_message_time = datetime.now()
+                    continue
+                    
                 except ConnectionResetError:
-                    info_log(f"Connection reset by client {client_addr}")
+                    info_log(f"Connection reset by client {client_addr} (received {message_count} messages)")
                     break
                 except Exception as e:
                     info_log(f"Socket error with client {client_addr}: {e}")
@@ -638,6 +1153,26 @@ def periodic_save():
         except Exception as e:
             print(f"Error during periodic save: {e}")
 
+# Function to monitor connection and data flow
+def connection_monitor():
+    """Monitor connection status and warn if no data is received"""
+    while True:
+        time.sleep(60)  # Check every minute
+        
+        if not connection_established:
+            info_log("⚠️ WARNING: No RPi connection established yet")
+            info_log("   Make sure the RPi detector is running with --macbook-ip <this_machine_ip>")
+            continue
+        
+        if not first_message_received and connection_time is not None:
+            elapsed = (datetime.now() - connection_time).total_seconds()
+            if elapsed > 60:  # Connected for >1 minute but no data
+                info_log(f"⚠️ WARNING: Connected for {elapsed:.0f}s but no data received!")
+                info_log("   Check that:")
+                info_log("   1. RPi detector is capturing packets (check interface name)")
+                info_log("   2. There is network traffic to capture")
+                info_log("   3. RPi detector is successfully sending features")
+
 if __name__ == "__main__":
     # Check for required dependencies
     missing_deps = []
@@ -667,22 +1202,28 @@ if __name__ == "__main__":
     info_log(f"Attacker MAC: {ATTACKER_MAC}")
     info_log(f"Camera MAC: {CAMERA_MAC}")
     info_log(f"Debug mode: {'Enabled' if DEBUG else 'Disabled'}")
+    info_log(f"Threshold mode: {'Adaptive' if USE_ADAPTIVE_THRESHOLDS else 'Static'}")
+    if not USE_ADAPTIVE_THRESHOLDS:
+        info_log(f"  Static thresholds: {STATIC_THRESHOLDS}")
+    info_log(f"Deny list: {'Enabled' if denylist.enabled else 'Disabled'}")
+    if denylist.enabled:
+        info_log(f"  Loaded {len(denylist.deny_list)} malicious IPs")
     info_log("=" * 40)
     
-    # Try to load existing models and thresholds
-    info_log("Checking for existing models and thresholds...")
-    models_loaded = try_load_models()
-    thresholds_loaded = load_existing_thresholds()
+    # Models will be trained from scratch (not loaded from disk)
+    info_log("Models will be trained from scratch on incoming data")
+    info_log("⚠️ Models will be initialized on first data sample")
+    info_log("⚠️ Ensure RPi detector is running and connected!")
+    info_log("")
     
-    if models_loaded:
-        info_log("✅ Successfully loaded existing models")
+    if USE_ADAPTIVE_THRESHOLDS:
+        thresholds_loaded = load_existing_thresholds()
+        if thresholds_loaded:
+            info_log("✅ Successfully loaded existing adaptive thresholds")
+        else:
+            info_log(f"⚠️ Using initial adaptive thresholds (from static): {adaptive_thresholds}")
     else:
-        info_log("⚠️ No existing models found - will initialize on first data sample")
-    
-    if thresholds_loaded:
-        info_log("✅ Successfully loaded existing adaptive thresholds")
-    else:
-        info_log(f"⚠️ Using default initial thresholds: {adaptive_thresholds}")
+        info_log(f"⚠️ Adaptive thresholds disabled - using static thresholds: {STATIC_THRESHOLDS}")
     
     # Start server thread
     server_thread = threading.Thread(target=server_loop, daemon=True)
@@ -692,9 +1233,15 @@ if __name__ == "__main__":
     save_thread = threading.Thread(target=periodic_save, daemon=True)
     save_thread.start()
     
+    # Start connection monitoring thread
+    monitor_thread = threading.Thread(target=connection_monitor, daemon=True)
+    monitor_thread.start()
+    
     info_log(f"\n✅ DL anomaly detector started. Listening on port {PORT}")
     info_log(f"📋 Expected connection format: {{'flow_key': '...', 'features': {...}, 'src_mac': '...', 'dst_mac': '...'}}")
     info_log(f"💻 Press Ctrl+C to stop")
+    info_log(f"📊 Connection monitoring active - will warn if no data received")
+    info_log("")
     
     try:
         # Keep main thread alive
