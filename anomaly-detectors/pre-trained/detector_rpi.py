@@ -9,6 +9,7 @@ import sys
 import threading
 from datetime import datetime
 from collections import defaultdict, deque
+import ipaddress
 
 import numpy as np
 import pandas as pd
@@ -46,6 +47,145 @@ OCSVM_THRESHOLD = -0.03
 LOF_THRESHOLD = -1.0
 COPOD_THRESHOLD = 0.8  # You may want to tune this value
 
+# Network functionality protocols that should always be allowed
+ALLOWED_NETWORK_PROTOCOLS = {
+    67,   # DHCP server
+    68,   # DHCP client
+    53,   # DNS
+}
+
+# ================= AbuseIPDB Deny List =================
+
+class AbuseIPDBDenyList:
+    """
+    Handles IP reputation checking using a local AbuseIPDB deny list CSV file.
+    CSV format: ip,country_code,abuse_confidence_score,last_reported_at
+    
+    Logic:
+    - If IP is in deny list: Flag as malicious (confirmed anomaly)
+    - If IP is private/local: Flag as suspicious (confirmed anomaly)
+    - If IP is public but not in deny list: Don't flag (likely false positive)
+    - Network functionality traffic (DHCP, DNS to router): Always whitelist
+    """
+    
+    def __init__(self, denylist_file=None, router_ip=None):
+        self.denylist_file = denylist_file
+        self.router_ip = router_ip
+        self.enabled = bool(denylist_file)
+        self.deny_list = {}
+        
+        if self.enabled:
+            self.load_denylist()
+        else:
+            print("ℹ️ AbuseIPDB deny list not enabled (no file provided)")
+    
+    def load_denylist(self):
+        """Load AbuseIPDB deny list from CSV file"""
+        try:
+            with open(self.denylist_file, 'r') as f:
+                lines = f.readlines()
+            
+            for line in lines[1:]:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(',')
+                if len(parts) >= 4:
+                    ip = parts[0]
+                    country_code = parts[1]
+                    abuse_score = int(parts[2]) if parts[2].isdigit() else 0
+                    last_reported = parts[3]
+                    
+                    self.deny_list[ip] = {
+                        'country_code': country_code,
+                        'score': abuse_score,
+                        'last_reported': last_reported
+                    }
+            
+            print(f"✅ Loaded {len(self.deny_list)} IPs from AbuseIPDB deny list")
+            
+        except Exception as e:
+            print(f"⚠️ Error loading deny list from {self.denylist_file}: {e}")
+            self.enabled = False
+    
+    def is_network_functionality(self, src_ip, dst_ip, src_port, dst_port):
+        """Check if traffic is network functionality (DHCP, DNS to router)"""
+        if (src_port == 67 and dst_port == 68) or (src_port == 68 and dst_port == 67):
+            return True, "dhcp"
+        
+        if self.router_ip and dst_ip == self.router_ip and dst_port == 53:
+            return True, "dns_to_router"
+        
+        return False, None
+    
+    def check_ip(self, src_ip, dst_ip, src_port, dst_port):
+        """Check IP against deny list and private IP ranges"""
+        result = {
+            'in_denylist': False,
+            'is_private': False,
+            'is_network_function': False,
+            'should_flag': False,
+            'reason': 'unknown',
+            'score': 0,
+            'country_code': '',
+            'remote_ip': None
+        }
+        
+        is_net_func, func_type = self.is_network_functionality(src_ip, dst_ip, src_port, dst_port)
+        if is_net_func:
+            result['is_network_function'] = True
+            result['should_flag'] = False
+            result['reason'] = f'network_functionality_{func_type}'
+            return result
+        
+        src_is_private = self.is_private_ip(src_ip)
+        dst_is_private = self.is_private_ip(dst_ip)
+        
+        if src_is_private and not dst_is_private:
+            remote_ip = dst_ip
+        elif not src_is_private and dst_is_private:
+            remote_ip = src_ip
+        elif src_is_private and dst_is_private:
+            result['is_private'] = True
+            result['should_flag'] = True
+            result['reason'] = 'private_to_private'
+            result['remote_ip'] = f"both_private_{src_ip}_to_{dst_ip}"
+            return result
+        else:
+            remote_ip = dst_ip
+        
+        result['remote_ip'] = remote_ip
+        
+        if not self.enabled:
+            result['should_flag'] = False
+            result['reason'] = 'denylist_disabled'
+            return result
+        
+        if remote_ip in self.deny_list:
+            result['in_denylist'] = True
+            result['should_flag'] = True
+            result['reason'] = 'in_denylist'
+            result['score'] = self.deny_list[remote_ip]['score']
+            result['country_code'] = self.deny_list[remote_ip]['country_code']
+            return result
+        
+        result['reason'] = 'public_ip_not_in_denylist'
+        result['should_flag'] = False
+        return result
+    
+    def is_private_ip(self, ip):
+        """Check if IP is in private/local range"""
+        try:
+            ip_obj = ipaddress.ip_address(ip)
+            return (
+                ip_obj.is_private or
+                ip_obj.is_loopback or
+                ip_obj.is_link_local or
+                ip_obj.is_multicast
+            )
+        except:
+            return False
+
 # ================= Args =================
 
 def get_args():
@@ -57,6 +197,10 @@ def get_args():
     p.add_argument('--attacker-mac', required=True, help='Attacker laptop MAC')
     p.add_argument('--camera-mac', required=True, help='Camera/server MAC')
     p.add_argument('--metrics-interval', type=int, default=60, help='Metrics save interval (seconds)')
+    p.add_argument('--denylist-file', type=str, default=None,
+                   help='Path to AbuseIPDB deny list CSV file')
+    p.add_argument('--router-ip', type=str, default=None,
+                   help='Router IP address for whitelisting network functionality traffic (DHCP, DNS)')
     p.add_argument('--verbose', action='store_true')
     return p.parse_args()
 
@@ -143,7 +287,28 @@ def flow_5tuple(pkt):
     dport = pkt[TCP].dport if TCP in pkt else (pkt[UDP].dport if UDP in pkt else None)
     return (ip.src, ip.dst, ip.proto, sport, dport)
 
+def extract_all_records(flow_stats):
+    """Extract ALL records without filtering by duration - for sending to DL server"""
+    records = []
+    for k, v in flow_stats.items():
+        duration = v['last_seen'] - v['first_seen']
+        record = {
+            'flow_duration': duration,
+            'flow_byts_s': v['bytes'] / duration if duration > 0 else 0.0,
+            'flow_pkts_s': v['packets'] / duration if duration > 0 else 0.0,
+            'pkt_len': np.mean(v['pkt_lens']) if v['pkt_lens'] else 0.0,
+            'pkt_size': np.std(v['pkt_lens']) if v['pkt_lens'] else 0.0,
+            'iat': np.mean(v['iat']) if v['iat'] else 0.0,
+            'tot_bwd_pkts': v['bwd_packets'],
+            'tot_fwd_pkts': v['fwd_packets'],
+            'totlen_bwd_pkts': v['bwd_bytes'],
+            'totlen_fwd_pkts': v['fwd_bytes']
+        }
+        records.append((k, v['src_mac'], v['dst_mac'], record))
+    return records
+
 def extract_records(flow_stats):
+    """Extract records filtered by duration - for local RPi detection"""
     records = []
     for k, v in flow_stats.items():
         duration = v['last_seen'] - v['first_seen']
@@ -261,28 +426,58 @@ class PerAlgorithmEvaluator:
         # Print summary
         print("\n=== Per-Algorithm Metrics Summary ===")
         for _, row in df.iterrows():
+            latency_str = f"{row['first_detection_latency_s']:.1f}s" if row['first_detection_latency_s'] is not None else "N/A"
             print(f"{row['algorithm']:>15}: P={row['precision']:.3f} R={row['recall']:.3f} "
-                  f"FPR={row['fpr']:.3f} Latency={row['first_detection_latency_s']:.1f}s")
+                  f"FPR={row['fpr']:.3f} Latency={latency_str}")
         return df
 
 # ================= Detection =================
 
-def detect_hst(hst, records, evaluator, attacker_mac, camera_mac):
+def detect_hst(hst, records, evaluator, attacker_mac, camera_mac, denylist=None):
     if not hst:
         return
     for key5t, src_mac, dst_mac, features in records:
         now = datetime.now()
-        gt_attack = (src_mac == attacker_mac and dst_mac == camera_mac)
+        # Ground truth: traffic is attack if it involves attacker AND camera
+        # This includes both attacker->camera and camera->attacker (responses)
+        gt_attack = (
+            (src_mac == attacker_mac and dst_mac == camera_mac) or
+            (src_mac == camera_mac and dst_mac == attacker_mac)
+        )
         evaluator.note_sample(now, gt_attack=gt_attack)
         score = None
         try:
             score = hst.score_one(features)
             # Mark as anomaly if score < threshold
-            if score < HST_THRESHOLD:
-                evaluator.note_alert(now, gt_attack=gt_attack, algorithm='HalfSpaceTrees')
-                log_anomaly(key5t, features, score, "HalfSpaceTrees")
-                if not gt_attack:
-                    log_misclassified_benign(key5t, features, score, "HalfSpaceTrees")
+            is_anom = score < HST_THRESHOLD
+            
+            if is_anom:
+                should_flag = True
+                if denylist and denylist.enabled:
+                    src_ip, dst_ip, proto, src_port, dst_port = key5t
+                    denylist_result = denylist.check_ip(src_ip, dst_ip, src_port, dst_port)
+                    
+                    # Step 2: Suppress network functionality
+                    if denylist_result['is_network_function']:
+                        should_flag = False
+                    # Step 3: Private IP = vulnerability (flag it)
+                    elif denylist_result['is_private']:
+                        should_flag = True
+                    # Step 4: Public IP - check deny list
+                    elif denylist_result['in_denylist']:
+                        should_flag = True
+                    else:
+                        should_flag = False  # Public IP not in deny list
+                
+                if should_flag:
+                    evaluator.note_alert(now, gt_attack=gt_attack, algorithm='HalfSpaceTrees')
+                    log_anomaly(key5t, features, score, "HalfSpaceTrees")
+                    if not gt_attack:
+                        log_misclassified_benign(key5t, features, score, "HalfSpaceTrees")
+                else:
+                    evaluator.note_no_alert(now, gt_attack=gt_attack, algorithm='HalfSpaceTrees')
+                    if gt_attack:
+                        log_missed_anomaly(key5t, features, score, "HalfSpaceTrees")
             else:
                 evaluator.note_no_alert(now, gt_attack=gt_attack, algorithm='HalfSpaceTrees')
                 if gt_attack:
@@ -290,7 +485,40 @@ def detect_hst(hst, records, evaluator, attacker_mac, camera_mac):
         except Exception as e:
             print(f"⚠️ HST scoring error: {e}")
 
-def detect_classical(models, df_scaled, records, evaluator, attacker_mac, camera_mac):
+def check_denylist_suppression(key5t, denylist):
+    """
+    Helper to check if anomaly should be flagged based on deny list logic.
+    Returns: (should_flag, reason)
+    
+    Logic:
+    1. ML detected anomaly
+    2. Check if network functionality → suppress
+    3. If private IP → flag as vulnerability
+    4. If public IP in deny list → flag as attack
+    5. If public IP not in deny list → suppress (likely FP)
+    """
+    if not denylist or not denylist.enabled:
+        return True, "denylist_disabled"  # No deny list, trust ML
+    
+    src_ip, dst_ip, proto, src_port, dst_port = key5t
+    result = denylist.check_ip(src_ip, dst_ip, src_port, dst_port)
+    
+    # Step 2: Suppress network functionality
+    if result['is_network_function']:
+        return False, result['reason']
+    
+    # Step 3: Private IP = vulnerability (flag it)
+    if result['is_private']:
+        return True, result['reason']
+    
+    # Step 4: Public IP - check deny list
+    if result['in_denylist']:
+        return True, result['reason']
+    
+    # Step 5: Public IP not in deny list = likely false positive
+    return False, result['reason']
+
+def detect_classical(models, df_scaled, records, evaluator, attacker_mac, camera_mac, denylist=None):
     # OC-SVM
     if 'ocsvm' in models:
         m = models['ocsvm']
@@ -298,14 +526,26 @@ def detect_classical(models, df_scaled, records, evaluator, attacker_mac, camera
         scores = m.decision_function(df_scaled)
         for ((key5t, src_mac, dst_mac, features), pred, score) in zip(records, preds, scores):
             now = datetime.now()
-            gt_attack = (src_mac == attacker_mac and dst_mac == camera_mac)
+            # Ground truth: traffic is attack if it involves attacker AND camera
+            gt_attack = (
+                (src_mac == attacker_mac and dst_mac == camera_mac) or
+                (src_mac == camera_mac and dst_mac == attacker_mac)
+            )
             evaluator.note_sample(now, gt_attack=gt_attack)
             # Mark as anomaly if score < threshold
-            if score < OCSVM_THRESHOLD:
-                evaluator.note_alert(now, gt_attack=gt_attack, algorithm='OC-SVM')
-                log_anomaly(key5t, features, score, "OC-SVM")
-                if not gt_attack:
-                    log_misclassified_benign(key5t, features, score, "OC-SVM")
+            is_anom = score < OCSVM_THRESHOLD
+            
+            if is_anom:
+                should_flag, reason = check_denylist_suppression(key5t, denylist)
+                if should_flag:
+                    evaluator.note_alert(now, gt_attack=gt_attack, algorithm='OC-SVM')
+                    log_anomaly(key5t, features, score, "OC-SVM")
+                    if not gt_attack:
+                        log_misclassified_benign(key5t, features, score, "OC-SVM")
+                else:
+                    evaluator.note_no_alert(now, gt_attack=gt_attack, algorithm='OC-SVM')
+                    if gt_attack:
+                        log_missed_anomaly(key5t, features, score, "OC-SVM")
             else:
                 evaluator.note_no_alert(now, gt_attack=gt_attack, algorithm='OC-SVM')
                 if gt_attack:
@@ -318,14 +558,25 @@ def detect_classical(models, df_scaled, records, evaluator, attacker_mac, camera
         scores = m.decision_function(df_scaled)
         for ((key5t, src_mac, dst_mac, features), pred, score) in zip(records, preds, scores):
             now = datetime.now()
-            gt_attack = (src_mac == attacker_mac and dst_mac == camera_mac)
+            gt_attack = (
+                (src_mac == attacker_mac and dst_mac == camera_mac) or
+                (src_mac == camera_mac and dst_mac == attacker_mac)
+            )
             evaluator.note_sample(now, gt_attack=gt_attack)
             # Mark as anomaly if score < threshold
-            if score < LOF_THRESHOLD:
-                evaluator.note_alert(now, gt_attack=gt_attack, algorithm='LOF')
-                log_anomaly(key5t, features, score, "LOF")
-                if not gt_attack:
-                    log_misclassified_benign(key5t, features, score, "LOF")
+            is_anom = score < LOF_THRESHOLD
+            
+            if is_anom:
+                should_flag, reason = check_denylist_suppression(key5t, denylist)
+                if should_flag:
+                    evaluator.note_alert(now, gt_attack=gt_attack, algorithm='LOF')
+                    log_anomaly(key5t, features, score, "LOF")
+                    if not gt_attack:
+                        log_misclassified_benign(key5t, features, score, "LOF")
+                else:
+                    evaluator.note_no_alert(now, gt_attack=gt_attack, algorithm='LOF')
+                    if gt_attack:
+                        log_missed_anomaly(key5t, features, score, "LOF")
             else:
                 evaluator.note_no_alert(now, gt_attack=gt_attack, algorithm='LOF')
                 if gt_attack:
@@ -338,14 +589,25 @@ def detect_classical(models, df_scaled, records, evaluator, attacker_mac, camera
         scores = m.decision_function(df_scaled)
         for ((key5t, src_mac, dst_mac, features), pred, score) in zip(records, preds, scores):
             now = datetime.now()
-            gt_attack = (src_mac == attacker_mac and dst_mac == camera_mac)
+            gt_attack = (
+                (src_mac == attacker_mac and dst_mac == camera_mac) or
+                (src_mac == camera_mac and dst_mac == attacker_mac)
+            )
             evaluator.note_sample(now, gt_attack=gt_attack)
             # Mark as anomaly if score > threshold
-            if score > COPOD_THRESHOLD:
-                evaluator.note_alert(now, gt_attack=gt_attack, algorithm='COPOD')
-                log_anomaly(key5t, features, score, "COPOD")
-                if not gt_attack:
-                    log_misclassified_benign(key5t, features, score, "COPOD")
+            is_anom = score > COPOD_THRESHOLD
+            
+            if is_anom:
+                should_flag, reason = check_denylist_suppression(key5t, denylist)
+                if should_flag:
+                    evaluator.note_alert(now, gt_attack=gt_attack, algorithm='COPOD')
+                    log_anomaly(key5t, features, score, "COPOD")
+                    if not gt_attack:
+                        log_misclassified_benign(key5t, features, score, "COPOD")
+                else:
+                    evaluator.note_no_alert(now, gt_attack=gt_attack, algorithm='COPOD')
+                    if gt_attack:
+                        log_missed_anomaly(key5t, features, score, "COPOD")
             else:
                 evaluator.note_no_alert(now, gt_attack=gt_attack, algorithm='COPOD')
                 if gt_attack:
@@ -363,6 +625,12 @@ class DetectorRPi:
         self.attacker_mac = args.attacker_mac.lower()
         self.camera_mac = args.camera_mac.lower()
         self.target_mac = args.target_mac.lower()
+        
+        # Initialize deny list
+        self.denylist = AbuseIPDBDenyList(
+            denylist_file=args.denylist_file,
+            router_ip=args.router_ip
+        )
         
         # Setup graceful exit
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -452,6 +720,15 @@ class DetectorRPi:
             nonlocal last_batch_time
             now = time.time()
             if now - last_batch_time > BATCH_INTERVAL:
+                # CRITICAL FIX: Send ALL flows to DL server first (before duration filtering)
+                # This ensures DL server receives continuous data regardless of flow duration
+                if macbook_sock:
+                    all_records = extract_all_records(FLOW_STATS)
+                    for (key5t, src_mac, dst_mac, features) in all_records:
+                        send_to_macbook(list(key5t), src_mac, dst_mac, features)
+                
+                # Now extract filtered records for LOCAL RPi detection only
+                # Short flows (<0.1s) are skipped for local detection but were already sent to DL
                 records = extract_records(FLOW_STATS)
                 if records:
                     df = pd.DataFrame([rec for (_, _, _, rec) in records], columns=FEATURES)
@@ -462,12 +739,8 @@ class DetectorRPi:
                         self.scaler.fit(df.values)
                         X_scaled = self.scaler.transform(df.values)
 
-                    detect_hst(self.models.get('hst'), records, self.evaluator, self.attacker_mac, self.camera_mac)
-                    detect_classical(self.models, X_scaled, records, self.evaluator, self.attacker_mac, self.camera_mac)
-
-                    if macbook_sock:
-                        for (key5t, src_mac, dst_mac, features) in records:
-                            send_to_macbook(list(key5t), src_mac, dst_mac, features)
+                    detect_hst(self.models.get('hst'), records, self.evaluator, self.attacker_mac, self.camera_mac, self.denylist)
+                    detect_classical(self.models, X_scaled, records, self.evaluator, self.attacker_mac, self.camera_mac, self.denylist)
 
                 FLOW_STATS.clear()
                 last_batch_time = now
