@@ -31,3 +31,5 @@ Refer to the [anomaly-detectors README](anomaly-detectors/pre-trained/README.md 
 Includes supplementary scripts used for data processing and performing a Denial-of-Service (DoS) attack.
 
 ---
+
+*GitHub Copilot was used as a coding assistant for implementation.*
