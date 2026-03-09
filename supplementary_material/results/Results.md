@@ -1,0 +1,1 @@
+This folder contains the results of the experiments for each algorithm and each scenario, over a trial of 3 runs. It contains the results, logs of correctly and misclassified anomalies, and the scores associated with each anomaly for further inspection.
